@@ -1,7 +1,9 @@
 import os
 import re
+import json
 import asyncio
 import urllib.request
+import urllib.parse
 import subprocess
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, CallbackQuery
@@ -52,13 +54,6 @@ FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
 print(f"✅ ffmpeg:  {FFMPEG_EXE_PATH}")
 print(f"✅ ffprobe: {FFPROBE_EXE_PATH}")
 
-# Путь к cookies (если файл есть в корне проекта — используется автоматически)
-COOKIES_PATH = "cookies.txt" if os.path.exists("cookies.txt") else None
-if COOKIES_PATH:
-    print("🍪 Найден cookies.txt — TikTok/Instagram будут использовать его")
-else:
-    print("ℹ cookies.txt не найден — TikTok может блокировать IP")
-
 
 # ============================================================
 #         УТИЛИТЫ ЧИСТКИ МЕТАДАННЫХ
@@ -107,43 +102,83 @@ def clean_meta(s, max_len=64, strip_author: str = "") -> str:
     return s[:max_len].strip()
 
 
-def extract_metadata(info: dict):
-    extractor = (info.get('extractor_key') or info.get('extractor') or '').lower()
+# ============================================================
+#       TIKTOK через публичный API tikwm.com
+# ============================================================
+def _download_file(url, out_path, timeout=120):
+    """Качает файл по прямой ссылке с прогрессом в консоль."""
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = int(r.headers.get('Content-Length', 0))
+        done = 0
+        with open(out_path, 'wb') as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    pct = done * 100 // total
+                    print(f"\r⬇ {pct}% ({done}/{total})", end="", flush=True)
+        print()
+    return out_path
 
-    if 'tiktok' in extractor:
-        raw_uploader = (
-            info.get('uploader') or info.get('creator') or info.get('channel') or ''
-        )
-        performer = clean_meta(raw_uploader, max_len=64) or "TikTok"
 
-        track = clean_meta(info.get('track'), max_len=64)
-        junk_tracks = {
-            "original sound", "оригинальный звук",
-            "original sound tiktok", "оригинальный звук tiktok",
-            "original music", "оригинальная музыка",
-        }
-        track_ok = (
-            track
-            and track.lower().strip() not in junk_tracks
-            and not track.lower().startswith("original sound")
-            and not track.lower().startswith("оригинальный звук")
-        )
+def tiktok_via_api(url, mode):
+    """Скачивает TikTok через tikwm.com. Возвращает (path, title, duration, cover_url)."""
+    api_url = f"https://tikwm.com/api/?url={urllib.parse.quote(url)}&hd=1"
+    req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        raw = r.read().decode('utf-8', errors='ignore')
 
-        if track_ok:
-            title = track
-        else:
-            title = clean_meta(info.get('title'), max_len=64, strip_author=performer)
-            if not title:
-                title = performer
+    data = json.loads(raw)
+    if data.get('code') != 0:
+        raise RuntimeError(f"TikTok API: {data.get('msg', 'unknown error')}")
 
-        return title, performer
+    d = data['data']
+    vid_id = d.get('id') or 'tiktok'
+    title = clean_meta(d.get('title') or 'tiktok')
+    author = (d.get('author') or {}).get('unique_id') or ''
+    duration = d.get('duration')
+    cover_url = d.get('cover') or d.get('origin_cover')
 
-    title = clean_meta(info.get('title'), max_len=100) or "audio"
-    performer = clean_meta(
-        info.get('artist') or info.get('uploader') or info.get('channel')
-        or info.get('creator') or '', max_len=64,
-    ) or "Unknown"
-    return title, performer
+    # Чистим title от ника автора в начале
+    if author:
+        title = clean_meta(d.get('title') or 'tiktok', strip_author=author)
+
+    if mode == 'audio':
+        media_url = d.get('music')
+        if not media_url:
+            raise RuntimeError("TikTok API: не вернул ссылку на аудио")
+        tmp_path = f"downloads/{vid_id}_audio_raw"
+        _download_file(media_url, tmp_path)
+
+        # Конвертируем в mp3 через ffmpeg (если исходник не mp3)
+        out_path = f"downloads/{vid_id}.mp3"
+        cmd = [
+            FFMPEG_EXE_PATH, "-y", "-i", tmp_path,
+            "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+            out_path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg: {r.stderr[-300:] if r.stderr else 'unknown'}")
+
+        return out_path, title, duration, None
+
+    else:  # video
+        # play — без водяного знака, hdplay — HD без водяного знака
+        media_url = d.get('hdplay') or d.get('play')
+        if not media_url:
+            raise RuntimeError("TikTok API: не вернул ссылку на видео")
+        out_path = f"downloads/{vid_id}.mp4"
+        _download_file(media_url, out_path)
+        return out_path, title, duration, None
 
 
 # ============================================================
@@ -462,74 +497,120 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     status_msg = await callback.message.answer("⏳ Подключаюсь к источнику...")
     await callback.answer()
 
-    ydl_opts = {
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'noprogress': True,
-        'noplaylist': True,
-        'ffmpeg_location': FFMPEG_DIR,
-    }
-
-    if COOKIES_PATH:
-        ydl_opts['cookiefile'] = COOKIES_PATH
-
-    if "youtube.com" in url or "youtu.be" in url:
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': 'android,web'}}
-
-    if mode == "get_audio":
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        })
-    else:
-        ydl_opts.update({
-            'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
-            'merge_output_format': 'mp4',
-        })
-
     loop = asyncio.get_event_loop()
-    last_edit = {"t": 0.0}
-
-    def _fmt_size(b):
-        if not b:
-            return "?"
-        for unit in ("B", "KB", "MB", "GB"):
-            if b < 1024:
-                return f"{b:.1f}{unit}"
-            b /= 1024
-        return f"{b:.1f}TB"
-
-    def _progress_hook(d):
-        if d.get("status") != "downloading":
-            return
-        now = loop.time()
-        if now - last_edit["t"] < 1.2:
-            return
-        last_edit["t"] = now
-        pct = d.get("_percent_str", "?").strip()
-        speed = d.get("_speed_str", "?").strip()
-        eta = d.get("_eta_str", "?").strip()
-        total = _fmt_size(d.get("total_bytes") or d.get("total_bytes_estimate"))
-        done = _fmt_size(d.get("downloaded_bytes"))
-        text = (
-            f"📥 *Скачивание...*\n"
-            f"`{pct}` от `{total}`\n"
-            f"📦 Скачано: `{done}`\n"
-            f"⚡ Скорость: `{speed}`\n"
-            f"⏱ Осталось: `{eta}`"
-        )
-        asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text), loop)
-
-    ydl_opts['progress_hooks'] = [_progress_hook]
+    is_tiktok = "tiktok.com" in url or "vm.tiktok.com" in url or "vt.tiktok.com" in url
 
     final_filename = None
     thumb_path = None
+
     try:
+        # ============================================================
+        #       TIKTOK → через публичный API (обходит блокировку IP)
+        # ============================================================
+        if is_tiktok:
+            try:
+                await status_msg.edit_text("📥 Скачиваю через TikTok API...")
+            except Exception:
+                pass
+
+            final_filename, title, duration, _ = await loop.run_in_executor(
+                None, tiktok_via_api, url, mode
+            )
+
+            if not os.path.exists(final_filename):
+                raise FileNotFoundError(f"API вернул путь, но файл не найден: {final_filename}")
+
+            if mode == "get_audio":
+                try:
+                    await status_msg.edit_text("📤 Отправляю в Telegram...")
+                except Exception:
+                    pass
+                kwargs = {
+                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                    'title': title,
+                    'caption': "🎵 Звуковая дорожка готова!",
+                }
+                if duration:
+                    kwargs['duration'] = int(duration)
+                await callback.message.answer_audio(**kwargs)
+            else:
+                try:
+                    await status_msg.edit_text("📤 Отправляю в Telegram...")
+                except Exception:
+                    pass
+                await callback.message.answer_video(
+                    video=FSInputFile(final_filename, filename=f"{title}.mp4"),
+                    caption="🎬 Видео успешно скачано!",
+                    duration=int(duration) if duration else None,
+                )
+
+            await status_msg.delete()
+            return  # Выходим, TikTok обработан
+
+        # ============================================================
+        #       ВСЁ ОСТАЛЬНОЕ (YouTube/IG/FB/...) → через yt-dlp
+        # ============================================================
+        ydl_opts = {
+            'outtmpl': 'downloads/%(id)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'noprogress': True,
+            'noplaylist': True,
+            'ffmpeg_location': FFMPEG_DIR,
+        }
+
+        if "youtube.com" in url or "youtu.be" in url:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': 'android,web'}}
+
+        if mode == "get_audio":
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            })
+        else:
+            ydl_opts.update({
+                'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
+                'merge_output_format': 'mp4',
+            })
+
+        last_edit = {"t": 0.0}
+
+        def _fmt_size(b):
+            if not b:
+                return "?"
+            for unit in ("B", "KB", "MB", "GB"):
+                if b < 1024:
+                    return f"{b:.1f}{unit}"
+                b /= 1024
+            return f"{b:.1f}TB"
+
+        def _progress_hook(d):
+            if d.get("status") != "downloading":
+                return
+            now = loop.time()
+            if now - last_edit["t"] < 1.2:
+                return
+            last_edit["t"] = now
+            pct = d.get("_percent_str", "?").strip()
+            speed = d.get("_speed_str", "?").strip()
+            eta = d.get("_eta_str", "?").strip()
+            total = _fmt_size(d.get("total_bytes") or d.get("total_bytes_estimate"))
+            done = _fmt_size(d.get("downloaded_bytes"))
+            text = (
+                f"📥 *Скачивание...*\n"
+                f"`{pct}` от `{total}`\n"
+                f"📦 Скачано: `{done}`\n"
+                f"⚡ Скорость: `{speed}`\n"
+                f"⏱ Осталось: `{eta}`"
+            )
+            asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text), loop)
+
+        ydl_opts['progress_hooks'] = [_progress_hook]
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
             filename = ydl.prepare_filename(info)
@@ -545,68 +626,65 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
             raise FileNotFoundError(f"Файл не найден. Ожидался один из: {candidates}")
 
         duration = info.get('duration')
-        extractor = (info.get('extractor_key') or info.get('extractor') or '').lower()
-        is_tiktok = 'tiktok' in extractor
 
-        title, performer = extract_metadata(info)
-        print(f"🎵 [{extractor}] tiktok={is_tiktok} title={title!r} performer={performer!r}")
+        # Метаданные для YouTube/IG/FB
+        def _clean_yt(s, max_len=100):
+            if not s:
+                return ""
+            s = str(s).strip()
+            s = re.sub(r"https?://\S+", " ", s)
+            s = EMOJI_RE.sub(" ", s)
+            s = " ".join(s.split())
+            return s[:max_len].strip()
+
+        title = _clean_yt(info.get('title')) or "media"
+        performer = _clean_yt(
+            info.get('artist') or info.get('uploader')
+            or info.get('channel') or info.get('creator') or '', max_len=64
+        ) or "Unknown"
 
         if mode == "get_audio":
-            if is_tiktok:
+            # Скачиваем обложку для YouTube/IG/FB
+            thumb_url = info.get('thumbnail')
+            if thumb_url:
                 try:
-                    await status_msg.edit_text("📤 Отправляю в Telegram...")
-                except Exception:
-                    pass
-                kwargs = {
-                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
-                    'title': title,
-                    'caption': "🎵 Звуковая дорожка готова!",
-                }
-                if duration:
-                    kwargs['duration'] = int(duration)
-                await callback.message.answer_audio(**kwargs)
-            else:
-                thumb_url = info.get('thumbnail')
-                if thumb_url:
-                    try:
-                        thumb_path = f"downloads/{info['id']}_thumb.jpg"
-                        req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req, timeout=15) as r:
-                            data = r.read()
-                        tmp_raw = f"downloads/{info['id']}_thumb_raw"
-                        with open(tmp_raw, 'wb') as f:
-                            f.write(data)
-                        img = Image.open(tmp_raw).convert("RGB")
-                        img.save(thumb_path, "JPEG", quality=90)
-                        os.remove(tmp_raw)
-                    except Exception as te:
-                        print(f"⚠ Не удалось получить обложку: {te}")
-                        thumb_path = None
+                    thumb_path = f"downloads/{info['id']}_thumb.jpg"
+                    req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        data = r.read()
+                    tmp_raw = f"downloads/{info['id']}_thumb_raw"
+                    with open(tmp_raw, 'wb') as f:
+                        f.write(data)
+                    img = Image.open(tmp_raw).convert("RGB")
+                    img.save(thumb_path, "JPEG", quality=90)
+                    os.remove(tmp_raw)
+                except Exception as te:
+                    print(f"⚠ Не удалось получить обложку: {te}")
+                    thumb_path = None
 
-                try:
-                    await status_msg.edit_text("📤 Отправляю в Telegram...")
-                except Exception:
-                    pass
+            try:
+                await status_msg.edit_text("📤 Отправляю в Telegram...")
+            except Exception:
+                pass
 
-                kwargs = {
-                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
-                    'title': title,
-                    'performer': performer,
-                    'caption': "🎵 Звуковая дорожка готова!",
-                }
-                if duration:
-                    kwargs['duration'] = int(duration)
-                if thumb_path and os.path.exists(thumb_path):
-                    kwargs['thumbnail'] = FSInputFile(thumb_path)
-                await callback.message.answer_audio(**kwargs)
+            kwargs = {
+                'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                'title': title,
+                'performer': performer,
+                'caption': "🎵 Звуковая дорожка готова!",
+            }
+            if duration:
+                kwargs['duration'] = int(duration)
+            if thumb_path and os.path.exists(thumb_path):
+                kwargs['thumbnail'] = FSInputFile(thumb_path)
+            await callback.message.answer_audio(**kwargs)
         else:
             try:
                 await status_msg.edit_text("📤 Отправляю в Telegram...")
             except Exception:
                 pass
-            video_file = FSInputFile(final_filename, filename=f"{title}.mp4")
             await callback.message.answer_video(
-                video=video_file,
+                video=FSInputFile(final_filename, filename=f"{title}.mp4"),
                 caption="🎬 Видео успешно скачано!",
                 duration=int(duration) if duration else None,
             )
