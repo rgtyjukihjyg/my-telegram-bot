@@ -52,6 +52,35 @@ FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
 print(f"✅ ffmpeg:  {FFMPEG_EXE_PATH}")
 print(f"✅ ffprobe: {FFPROBE_EXE_PATH}")
 
+# --- ЗАПУСК POT-ПРОВАЙДЕРА ---
+POT_PROVIDER_PROCESS = None
+
+def start_pot_provider():
+    """Запускает POT-провайдер в фоне, если он ещё не запущен."""
+    global POT_PROVIDER_PROCESS
+    try:
+        # Проверяем, не запущен ли уже
+        r = subprocess.run(["pgrep", "-f", "bgutil"], capture_output=True, text=True)
+        if r.stdout.strip():
+            print("✅ POT-провайдер уже запущен")
+            return
+    except Exception:
+        pass
+
+    try:
+        print("🚀 Запускаю POT-провайдер...")
+        POT_PROVIDER_PROCESS = subprocess.Popen(
+            ["bgutil-ytdlp-pot-provider", "--port", "4416"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print("✅ POT-провайдер запущен на порту 4416")
+    except Exception as e:
+        print(f"⚠ Не удалось запустить POT-провайдер: {e}")
+
+# Запускаем провайдер при старте бота
+start_pot_provider()
+
 
 # ============================================================
 #         УТИЛИТЫ ЧИСТКИ МЕТАДАННЫХ
@@ -127,14 +156,68 @@ def _extract_video_id(url):
 
 
 # ============================================================
-#   МЕТОД 1: Cobalt (несколько публичных инстансов)
+#   МЕТОД 1: yt-dlp с POT-провайдером
+# ============================================================
+def _try_ytdlp_with_pot(url, mode):
+    """Основной метод: yt-dlp + POT-провайдер."""
+    try:
+        print("🎬 Пробую yt-dlp с POT-провайдером...")
+        ydl_opts = {
+            'outtmpl': 'downloads/%(id)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'noprogress': True,
+            'noplaylist': True,
+            'ffmpeg_location': FFMPEG_DIR,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['tv', 'mweb'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
+            # Указываем POT-провайдеру, где искать токены
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['tv', 'mweb'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
+        }
+        if mode == "audio":
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{'key': 'FFmpegExtractAudio',
+                                    'preferredcodec': 'mp3', 'preferredquality': '192'}],
+            })
+        else:
+            ydl_opts.update({
+                'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
+                'merge_output_format': 'mp4',
+            })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+
+        base, _ = os.path.splitext(filename)
+        candidates = [base + ".mp3", filename + ".mp3"] if mode == "audio" else \
+                     [filename, base + ".mp4", base + ".mkv", base + ".webm"]
+        final = next((p for p in candidates if os.path.exists(p)), None)
+        if final:
+            print("   ✅ yt-dlp с POT-провайдером сработал")
+            return final, clean_meta(info.get('title') or 'youtube'), info.get('duration'), clean_meta(info.get('uploader') or '', max_len=64)
+    except Exception as e:
+        print(f"   ⚠ yt-dlp с POT: {str(e)[:120]}")
+    return None
+
+
+# ============================================================
+#   МЕТОД 2: Cobalt (публичные инстансы)
 # ============================================================
 COBALT_INSTANCES = [
     "https://api.cobalt.tools",
     "https://cobalt-api.kwiatekmiki.com",
     "https://co.wuk.sh",
-    "https://cobalt-api.meowing.de",
-    "https://api.cobalt.best",
 ]
 
 
@@ -161,9 +244,8 @@ def _try_cobalt(url, mode):
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = json.loads(r.read().decode("utf-8", errors="ignore"))
 
-            status = data.get("status")
-            if status in ("error", "rate-limit"):
-                print(f"   ❌ {instance}: {data.get('text') or status}")
+            if data.get("status") in ("error", "rate-limit"):
+                print(f"   ❌ {instance}: {data.get('text') or data.get('status')}")
                 continue
 
             media_url = data.get("url")
@@ -183,16 +265,12 @@ def _try_cobalt(url, mode):
 
 
 # ============================================================
-#   МЕТОД 2: Invidious (публичные инстансы)
+#   МЕТОД 3: Invidious
 # ============================================================
 INVIDIOUS_INSTANCES = [
     "https://inv.nadeko.net",
     "https://invidious.nerdvpn.de",
     "https://yewtu.be",
-    "https://invidious.f5.si",
-    "https://iv.melmac.space",
-    "https://invidious.privacyredirect.com",
-    "https://invidious.reallyaweso.me",
 ]
 
 
@@ -258,65 +336,18 @@ def _try_invidious(url, mode):
 
 
 # ============================================================
-#   МЕТОД 3: yt-dlp с перебором клиентов
-# ============================================================
-YT_CLIENTS = ["ios", "android_vr", "tv_embedded", "mweb", "tv"]
-
-
-def _try_ytdlp(url, mode):
-    for client in YT_CLIENTS:
-        try:
-            print(f"🎬 Пробую yt-dlp client={client}")
-            ydl_opts = {
-                'outtmpl': 'downloads/%(id)s.%(ext)s',
-                'quiet': True,
-                'no_warnings': True,
-                'noprogress': True,
-                'noplaylist': True,
-                'ffmpeg_location': FFMPEG_DIR,
-                'extractor_args': {'youtube': {'player_client': [client]}},
-                'http_headers': {
-                    'User-Agent': 'com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
-                },
-            }
-            if mode == "audio":
-                ydl_opts.update({
-                    'format': 'bestaudio/best',
-                    'postprocessors': [{'key': 'FFmpegExtractAudio',
-                                        'preferredcodec': 'mp3', 'preferredquality': '192'}],
-                })
-            else:
-                ydl_opts.update({
-                    'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
-                    'merge_output_format': 'mp4',
-                })
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-
-            base, _ = os.path.splitext(filename)
-            candidates = [base + ".mp3", filename + ".mp3"] if mode == "audio" else \
-                         [filename, base + ".mp4", base + ".mkv", base + ".webm"]
-            final = next((p for p in candidates if os.path.exists(p)), None)
-            if final:
-                print(f"   ✅ yt-dlp сработал с client={client}")
-                return final, clean_meta(info.get('title') or 'youtube'), info.get('duration'), clean_meta(info.get('uploader') or '', max_len=64)
-        except Exception as e:
-            print(f"   ⚠ client={client}: {str(e)[:120]}")
-            continue
-    return None
-
-
-# ============================================================
 #   ГЛАВНАЯ ФУНКЦИЯ: перебор всех методов
 # ============================================================
 def youtube_download(url, mode):
-    """Пробует все доступные методы по очереди. Возвращает (path, title, duration, uploader)."""
-    # 1) Cobalt
+    """Пробует все методы по очереди. Возвращает (path, title, duration, uploader)."""
+    # 1) yt-dlp с POT-провайдером (самый надёжный)
+    result = _try_ytdlp_with_pot(url, mode)
+    if result:
+        return result
+
+    # 2) Cobalt
     result = _try_cobalt(url, mode)
     if result:
-        # Cobalt не даёт метаданные — вытащим через yt-dlp (без скачивания)
         try:
             with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True}) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -324,17 +355,12 @@ def youtube_download(url, mode):
         except Exception:
             return result, "youtube", None, "Unknown"
 
-    # 2) Invidious
+    # 3) Invidious
     result = _try_invidious(url, mode)
-    if result:
-        return result  # уже кортеж
-
-    # 3) yt-dlp с разными клиентами
-    result = _try_ytdlp(url, mode)
     if result:
         return result
 
-    raise RuntimeError("Все методы скачивания YouTube не сработали. Попробуйте позже или другую ссылку.")
+    raise RuntimeError("Все методы скачивания YouTube не сработали. Попробуйте позже.")
 
 
 # ============================================================
@@ -679,7 +705,7 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
 
         if is_youtube:
             try:
-                await status_msg.edit_text("📥 Скачиваю YouTube (перебор методов)...")
+                await status_msg.edit_text("📥 Скачиваю YouTube (POT + перебор методов)...")
             except Exception:
                 pass
             final_filename, title, duration, uploader = await loop.run_in_executor(None, youtube_download, url, mode)
