@@ -3,3 +3,4 @@ aiohttp>=3.9.0
 yt-dlp
 static-ffmpeg
 pillow
+curl_cffi
