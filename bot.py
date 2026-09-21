@@ -45,12 +45,19 @@ _cleanup_folder("downloads")
 _cleanup_folder("temp_photos")
 print("🧹 Временные папки очищены")
 
-# --- FFMPEG через static-ffmpeg ---
+# --- FFMPEG ---
 print("🔧 Проверяю ffmpeg / ffprobe...")
 FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
 FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
 print(f"✅ ffmpeg:  {FFMPEG_EXE_PATH}")
 print(f"✅ ffprobe: {FFPROBE_EXE_PATH}")
+
+# Путь к cookies (если файл есть в корне проекта — используется автоматически)
+COOKIES_PATH = "cookies.txt" if os.path.exists("cookies.txt") else None
+if COOKIES_PATH:
+    print("🍪 Найден cookies.txt — TikTok/Instagram будут использовать его")
+else:
+    print("ℹ cookies.txt не найден — TikTok может блокировать IP")
 
 
 # ============================================================
@@ -68,7 +75,6 @@ EMOJI_RE = re.compile(
     "]+",
     flags=re.UNICODE,
 )
-
 DASH_RE = re.compile(r"\s*[-–—−―]\s*")
 
 
@@ -456,9 +462,6 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     status_msg = await callback.message.answer("⏳ Подключаюсь к источнику...")
     await callback.answer()
 
-    # ============================================================
-    #   yt-dlp настройки + маскировка под Chrome
-    # ============================================================
     ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
@@ -466,16 +469,13 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
         'noprogress': True,
         'noplaylist': True,
         'ffmpeg_location': FFMPEG_DIR,
-        'impersonate': 'chrome',  # маскировка под реальный Chrome
-        'extractor_args': {
-            'tiktok': {
-                'app_info': '1234567890123456789',
-            },
-        },
     }
 
+    if COOKIES_PATH:
+        ydl_opts['cookiefile'] = COOKIES_PATH
+
     if "youtube.com" in url or "youtu.be" in url:
-        ydl_opts['extractor_args']['youtube'] = {'player_client': 'android,web'}
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': 'android,web'}}
 
     if mode == "get_audio":
         ydl_opts.update({
