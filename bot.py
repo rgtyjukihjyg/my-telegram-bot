@@ -103,59 +103,80 @@ def clean_meta(s, max_len=64, strip_author: str = "") -> str:
 
 
 # ============================================================
-#       YOUTUBE через публичный API Cobalt (обход блокировки IP)
+#       YOUTUBE через Piped API (обход блокировки IP)
 # ============================================================
-def youtube_via_cobalt(url, mode):
-    """Скачивает YouTube через Cobalt API. Возвращает (path, title, duration, cover_url)."""
-    api_url = "https://api.cobalt.tools/api/json"
-    payload = {
-        "url": url,
-        "isAudioOnly": mode == "audio",
-        "aFormat": "mp3" if mode == "audio" else "best",
-        "vQuality": "720" if mode == "video" else "max",
-        "filenamePattern": "classic",
-    }
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.projectsegfau.lt",
+    "https://pipedapi-libre.kavin.rocks",
+    "https://pipedapi.reallyaweso.me",
+]
 
-    req = urllib.request.Request(
-        api_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0"
-        },
-        method="POST"
-    )
+def youtube_via_piped(url, mode):
+    """Скачивает YouTube через Piped API. Возвращает (path, title, duration, uploader)."""
+    video_id = None
+    if "youtu.be/" in url:
+        video_id = url.split("youtu.be/")[1].split("?")[0].split("&")[0]
+    elif "youtube.com/watch" in url:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        video_id = qs.get("v", [None])[0]
+    elif "youtube.com/shorts/" in url:
+        video_id = url.split("youtube.com/shorts/")[1].split("?")[0].split("&")[0]
 
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", errors="ignore"))
+    if not video_id:
+        raise RuntimeError("Не удалось определить ID видео из ссылки")
 
-    status = data.get("status")
-    if status == "error":
-        raise RuntimeError(f"Cobalt: {data.get('text', 'unknown error')}")
-    if status == "rate-limit":
-        raise RuntimeError("Cobalt: rate limit, попробуйте позже")
-    if status == "picker":
-        # Если видео требует выбора качества — берём первый вариант
-        picker = data.get("picker", [])
-        if not picker:
-            raise RuntimeError("Cobalt: picker пуст")
-        media_url = picker[0].get("url")
-    else:
-        media_url = data.get("url") or data.get("audio")
+    last_error = None
+    data = None
 
-    if not media_url:
-        raise RuntimeError("Cobalt: не вернул прямую ссылку")
+    for instance in PIPED_INSTANCES:
+        try:
+            api_url = f"{instance}/streams/{video_id}"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode("utf-8", errors="ignore"))
+            if data and data.get("title"):
+                print(f"✅ Piped: использован инстанс {instance}")
+                break
+        except Exception as e:
+            last_error = e
+            print(f"⚠ Piped инстанс {instance} не ответил: {e}")
+            continue
 
-    # Определяем расширение
+    if not data or not data.get("title"):
+        raise RuntimeError(f"Все Piped инстансы недоступны. Последняя ошибка: {last_error}")
+
+    title = clean_meta(data.get("title") or "youtube")
+    duration = data.get("duration")
+    uploader = data.get("uploader") or ""
+
+    best = None
     if mode == "audio":
-        ext = ".mp3"
+        streams = data.get("audioStreams", [])
+        if not streams:
+            raise RuntimeError("Piped: нет аудио-потоков")
+        best = max(streams, key=lambda s: s.get("bitrate", 0) or 0)
+        media_url = best.get("url")
+        ext = ".m4a"
     else:
+        streams = data.get("videoStreams", [])
+        if not streams:
+            raise RuntimeError("Piped: нет видео-потоков")
+        with_audio = [s for s in streams if s.get("videoOnly") is False]
+        if with_audio:
+            best = max(with_audio, key=lambda s: s.get("height", 0) or 0)
+        else:
+            best = max(streams, key=lambda s: s.get("height", 0) or 0)
+        media_url = best.get("url")
         ext = ".mp4"
 
-    out_path = f"downloads/cobalt_{abs(hash(url)) % 10**8}{ext}"
+    if not media_url:
+        raise RuntimeError("Piped: не удалось получить прямую ссылку")
 
-    # Скачиваем файл по прямой ссылке
+    out_path = f"downloads/piped_{video_id}{ext}"
+
     req = urllib.request.Request(media_url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=120) as r:
         with open(out_path, "wb") as f:
@@ -165,18 +186,57 @@ def youtube_via_cobalt(url, mode):
                     break
                 f.write(chunk)
 
-    # Cobalt не даёт метаданные — вытащим их через yt-dlp без скачивания
-    try:
-        info_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-        with yt_dlp.YoutubeDL(info_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        title = clean_meta(info.get("title") or "youtube")
-        duration = info.get("duration")
-    except Exception:
-        title = "youtube"
-        duration = None
+    # Если видео получилось без звука (videoOnly) — склеиваем с аудио
+    if mode == "video" and best.get("videoOnly"):
+        try:
+            audio_streams = data.get("audioStreams", [])
+            if audio_streams:
+                best_audio = max(audio_streams, key=lambda s: s.get("bitrate", 0) or 0)
+                audio_url = best_audio.get("url")
+                if audio_url:
+                    audio_tmp = f"downloads/piped_{video_id}_audio.m4a"
+                    req_a = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req_a, timeout=120) as ra:
+                        with open(audio_tmp, "wb") as fa:
+                            while True:
+                                chunk = ra.read(65536)
+                                if not chunk:
+                                    break
+                                fa.write(chunk)
+                    merged = f"downloads/piped_{video_id}_merged.mp4"
+                    cmd = [
+                        FFMPEG_EXE_PATH, "-y",
+                        "-i", out_path,
+                        "-i", audio_tmp,
+                        "-c:v", "copy", "-c:a", "aac",
+                        "-shortest", merged,
+                    ]
+                    subprocess.run(cmd, capture_output=True, timeout=120)
+                    os.remove(out_path)
+                    os.remove(audio_tmp)
+                    if os.path.exists(merged):
+                        os.rename(merged, out_path)
+        except Exception as e:
+            print(f"⚠ Не удалось склеить видео+аудио: {e}")
 
-    return out_path, title, duration, None
+    # Если аудио — конвертируем в mp3
+    if mode == "audio":
+        mp3_path = f"downloads/piped_{video_id}.mp3"
+        cmd = [
+            FFMPEG_EXE_PATH, "-y", "-i", out_path,
+            "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
+            mp3_path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+        if r.returncode != 0:
+            raise RuntimeError(f"ffmpeg: {r.stderr[-300:] if r.stderr else 'unknown'}")
+        out_path = mp3_path
+
+    return out_path, title, duration, uploader
 
 
 # ============================================================
@@ -609,7 +669,7 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
             return
 
         # ============================================================
-        #       YOUTUBE → через Cobalt API
+        #       YOUTUBE → через Piped API
         # ============================================================
         if is_youtube:
             try:
@@ -617,8 +677,8 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
             except Exception:
                 pass
 
-            final_filename, title, duration, _ = await loop.run_in_executor(
-                None, youtube_via_cobalt, url, mode
+            final_filename, title, duration, uploader = await loop.run_in_executor(
+                None, youtube_via_piped, url, mode
             )
 
             if not os.path.exists(final_filename):
@@ -636,6 +696,8 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
                 }
                 if duration:
                     kwargs['duration'] = int(duration)
+                if uploader:
+                    kwargs['performer'] = clean_meta(uploader, max_len=64)
                 await callback.message.answer_audio(**kwargs)
             else:
                 try:
