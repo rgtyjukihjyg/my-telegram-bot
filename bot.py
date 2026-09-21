@@ -30,7 +30,7 @@ class BotStates(StatesGroup):
 os.makedirs("downloads", exist_ok=True)
 os.makedirs("temp_photos", exist_ok=True)
 
-# --- Чистка папок при старте (автоочистка от мусора прошлых запусков) ---
+# --- Чистка папок при старте ---
 def _cleanup_folder(folder):
     if os.path.exists(folder):
         for f in os.listdir(folder):
@@ -456,6 +456,9 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     status_msg = await callback.message.answer("⏳ Подключаюсь к источнику...")
     await callback.answer()
 
+    # ============================================================
+    #   yt-dlp настройки + маскировка под Chrome
+    # ============================================================
     ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
@@ -463,10 +466,16 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
         'noprogress': True,
         'noplaylist': True,
         'ffmpeg_location': FFMPEG_DIR,
+        'impersonate': 'chrome',  # маскировка под реальный Chrome
+        'extractor_args': {
+            'tiktok': {
+                'app_info': '1234567890123456789',
+            },
+        },
     }
 
     if "youtube.com" in url or "youtu.be" in url:
-        ydl_opts['extractor_args'] = {'youtube': {'player_client': 'android,web'}}
+        ydl_opts['extractor_args']['youtube'] = {'player_client': 'android,web'}
 
     if mode == "get_audio":
         ydl_opts.update({
