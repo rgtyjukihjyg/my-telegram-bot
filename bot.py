@@ -32,7 +32,6 @@ class BotStates(StatesGroup):
 os.makedirs("downloads", exist_ok=True)
 os.makedirs("temp_photos", exist_ok=True)
 
-# --- Чистка папок при старте ---
 def _cleanup_folder(folder):
     if os.path.exists(folder):
         for f in os.listdir(folder):
@@ -47,7 +46,6 @@ _cleanup_folder("downloads")
 _cleanup_folder("temp_photos")
 print("🧹 Временные папки очищены")
 
-# --- FFMPEG ---
 print("🔧 Проверяю ffmpeg / ffprobe...")
 FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
 FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
@@ -103,78 +101,10 @@ def clean_meta(s, max_len=64, strip_author: str = "") -> str:
 
 
 # ============================================================
-#       YOUTUBE через yt-dlp + bgutil-ytdlp-pot-provider
+#       УТИЛИТА: скачать файл по прямой ссылке
 # ============================================================
-def youtube_via_ytdlp(url, mode):
-    """
-    Скачивает YouTube через yt-dlp с плагином bgutil-ytdlp-pot-provider.
-    Плагин генерирует proof-of-origin токены (POT) для обхода блокировки.
-    """
-    ydl_opts = {
-        'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'noprogress': True,
-        'noplaylist': True,
-        'ffmpeg_location': FFMPEG_DIR,
-        # Используем TV-клиент и отключаем лишние запросы — POT-провайдер
-        # автоматически генерирует токены для обхода "Sign in to confirm"
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv', 'mweb'],
-                'player_skip': ['webpage', 'configs'],
-            }
-        },
-        # Маскировка под Safari
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
-        },
-    }
-
-    if mode == "audio":
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-        })
-    else:
-        ydl_opts.update({
-            'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
-            'merge_output_format': 'mp4',
-        })
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-
-    base_path, _ = os.path.splitext(filename)
-    if mode == "audio":
-        candidates = [base_path + ".mp3", filename + ".mp3"]
-    else:
-        candidates = [filename, base_path + ".mp4", base_path + ".mkv", base_path + ".webm"]
-
-    final_filename = next((p for p in candidates if os.path.exists(p)), None)
-    if not final_filename:
-        raise FileNotFoundError(f"Файл не найден: {candidates}")
-
-    title = clean_meta(info.get('title') or 'youtube')
-    performer = clean_meta(
-        info.get('uploader') or info.get('channel') or info.get('artist') or '',
-        max_len=64
-    ) or "Unknown"
-    duration = info.get('duration')
-
-    return final_filename, title, duration, performer
-
-
-# ============================================================
-#       TIKTOK через публичный API tikwm.com
-# ============================================================
-def _download_file(url, out_path, timeout=120):
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+def _download_direct(media_url, out_path, timeout=120):
+    req = urllib.request.Request(media_url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         with open(out_path, 'wb') as f:
             while True:
@@ -185,6 +115,231 @@ def _download_file(url, out_path, timeout=120):
     return out_path
 
 
+def _extract_video_id(url):
+    if "youtu.be/" in url:
+        return url.split("youtu.be/")[1].split("?")[0].split("&")[0]
+    if "youtube.com/watch" in url:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        return qs.get("v", [None])[0]
+    if "youtube.com/shorts/" in url:
+        return url.split("youtube.com/shorts/")[1].split("?")[0].split("&")[0]
+    return None
+
+
+# ============================================================
+#   МЕТОД 1: Cobalt (несколько публичных инстансов)
+# ============================================================
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://cobalt-api.kwiatekmiki.com",
+    "https://co.wuk.sh",
+    "https://cobalt-api.meowing.de",
+    "https://api.cobalt.best",
+]
+
+
+def _try_cobalt(url, mode):
+    for instance in COBALT_INSTANCES:
+        try:
+            print(f"🎬 Пробую Cobalt: {instance}")
+            payload = {
+                "url": url,
+                "videoQuality": "720" if mode == "video" else "max",
+                "audioFormat": "mp3",
+                "downloadMode": "audio" if mode == "audio" else "auto",
+            }
+            req = urllib.request.Request(
+                f"{instance}/",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+            status = data.get("status")
+            if status in ("error", "rate-limit"):
+                print(f"   ❌ {instance}: {data.get('text') or status}")
+                continue
+
+            media_url = data.get("url")
+            if not media_url:
+                print(f"   ❌ {instance}: нет ссылки")
+                continue
+
+            ext = ".mp3" if mode == "audio" else ".mp4"
+            out_path = f"downloads/cobalt_{abs(hash(url)) % 10**8}{ext}"
+            _download_direct(media_url, out_path)
+            print(f"   ✅ Cobalt сработал: {instance}")
+            return out_path
+        except Exception as e:
+            print(f"   ⚠ {instance}: {e}")
+            continue
+    return None
+
+
+# ============================================================
+#   МЕТОД 2: Invidious (публичные инстансы)
+# ============================================================
+INVIDIOUS_INSTANCES = [
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yewtu.be",
+    "https://invidious.f5.si",
+    "https://iv.melmac.space",
+    "https://invidious.privacyredirect.com",
+    "https://invidious.reallyaweso.me",
+]
+
+
+def _try_invidious(url, mode):
+    vid_id = _extract_video_id(url)
+    if not vid_id:
+        return None
+
+    for instance in INVIDIOUS_INSTANCES:
+        try:
+            print(f"🎬 Пробую Invidious: {instance}")
+            api_url = f"{instance}/api/v1/videos/{vid_id}"
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+            if not data.get("title"):
+                print(f"   ❌ {instance}: нет title")
+                continue
+
+            if mode == "audio":
+                streams = data.get("adaptiveFormats", [])
+                audio_streams = [s for s in streams if s.get("type", "").startswith("audio")]
+                if not audio_streams:
+                    print(f"   ❌ {instance}: нет аудио")
+                    continue
+                best = max(audio_streams, key=lambda s: s.get("bitrate", 0) or 0)
+                media_url = best.get("url")
+                ext = ".m4a"
+            else:
+                streams = data.get("formatStreams", [])
+                if not streams:
+                    print(f"   ❌ {instance}: нет видео")
+                    continue
+                best = max(streams, key=lambda s: int(s.get("resolution", "0p").rstrip("p") or 0))
+                media_url = best.get("url")
+                ext = ".mp4"
+
+            if not media_url:
+                continue
+
+            out_path = f"downloads/inv_{vid_id}{ext}"
+            _download_direct(media_url, out_path)
+
+            if mode == "audio":
+                mp3_path = f"downloads/inv_{vid_id}.mp3"
+                cmd = [FFMPEG_EXE_PATH, "-y", "-i", out_path,
+                       "-vn", "-c:a", "libmp3lame", "-b:a", "192k", mp3_path]
+                subprocess.run(cmd, capture_output=True, timeout=120)
+                try:
+                    os.remove(out_path)
+                except Exception:
+                    pass
+                if os.path.exists(mp3_path):
+                    out_path = mp3_path
+
+            print(f"   ✅ Invidious сработал: {instance}")
+            return out_path, clean_meta(data.get("title") or "youtube"), data.get("lengthSeconds"), clean_meta(data.get("author") or "", max_len=64)
+        except Exception as e:
+            print(f"   ⚠ {instance}: {e}")
+            continue
+    return None
+
+
+# ============================================================
+#   МЕТОД 3: yt-dlp с перебором клиентов
+# ============================================================
+YT_CLIENTS = ["ios", "android_vr", "tv_embedded", "mweb", "tv"]
+
+
+def _try_ytdlp(url, mode):
+    for client in YT_CLIENTS:
+        try:
+            print(f"🎬 Пробую yt-dlp client={client}")
+            ydl_opts = {
+                'outtmpl': 'downloads/%(id)s.%(ext)s',
+                'quiet': True,
+                'no_warnings': True,
+                'noprogress': True,
+                'noplaylist': True,
+                'ffmpeg_location': FFMPEG_DIR,
+                'extractor_args': {'youtube': {'player_client': [client]}},
+                'http_headers': {
+                    'User-Agent': 'com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+                },
+            }
+            if mode == "audio":
+                ydl_opts.update({
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{'key': 'FFmpegExtractAudio',
+                                        'preferredcodec': 'mp3', 'preferredquality': '192'}],
+                })
+            else:
+                ydl_opts.update({
+                    'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
+                    'merge_output_format': 'mp4',
+                })
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+
+            base, _ = os.path.splitext(filename)
+            candidates = [base + ".mp3", filename + ".mp3"] if mode == "audio" else \
+                         [filename, base + ".mp4", base + ".mkv", base + ".webm"]
+            final = next((p for p in candidates if os.path.exists(p)), None)
+            if final:
+                print(f"   ✅ yt-dlp сработал с client={client}")
+                return final, clean_meta(info.get('title') or 'youtube'), info.get('duration'), clean_meta(info.get('uploader') or '', max_len=64)
+        except Exception as e:
+            print(f"   ⚠ client={client}: {str(e)[:120]}")
+            continue
+    return None
+
+
+# ============================================================
+#   ГЛАВНАЯ ФУНКЦИЯ: перебор всех методов
+# ============================================================
+def youtube_download(url, mode):
+    """Пробует все доступные методы по очереди. Возвращает (path, title, duration, uploader)."""
+    # 1) Cobalt
+    result = _try_cobalt(url, mode)
+    if result:
+        # Cobalt не даёт метаданные — вытащим через yt-dlp (без скачивания)
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+            return result, clean_meta(info.get('title') or 'youtube'), info.get('duration'), clean_meta(info.get('uploader') or '', max_len=64)
+        except Exception:
+            return result, "youtube", None, "Unknown"
+
+    # 2) Invidious
+    result = _try_invidious(url, mode)
+    if result:
+        return result  # уже кортеж
+
+    # 3) yt-dlp с разными клиентами
+    result = _try_ytdlp(url, mode)
+    if result:
+        return result
+
+    raise RuntimeError("Все методы скачивания YouTube не сработали. Попробуйте позже или другую ссылку.")
+
+
+# ============================================================
+#       TIKTOK через tikwm.com
+# ============================================================
 def tiktok_via_api(url, mode):
     api_url = f"https://tikwm.com/api/?url={urllib.parse.quote(url)}&hd=1"
     req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -206,18 +361,15 @@ def tiktok_via_api(url, mode):
     if mode == 'audio':
         media_url = d.get('music')
         if not media_url:
-            raise RuntimeError("TikTok API: не вернул ссылку на аудио")
-        tmp_path = f"downloads/{vid_id}_audio_raw"
-        _download_file(media_url, tmp_path)
+            raise RuntimeError("TikTok API: нет ссылки на аудио")
+        tmp = f"downloads/{vid_id}_raw"
+        _download_direct(media_url, tmp)
         out_path = f"downloads/{vid_id}.mp3"
-        cmd = [
-            FFMPEG_EXE_PATH, "-y", "-i", tmp_path,
-            "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
-            out_path,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        r = subprocess.run([FFMPEG_EXE_PATH, "-y", "-i", tmp, "-vn",
+                           "-c:a", "libmp3lame", "-b:a", "192k", out_path],
+                          capture_output=True, text=True, encoding="utf-8", errors="ignore")
         try:
-            os.remove(tmp_path)
+            os.remove(tmp)
         except Exception:
             pass
         if r.returncode != 0:
@@ -226,9 +378,9 @@ def tiktok_via_api(url, mode):
     else:
         media_url = d.get('hdplay') or d.get('play')
         if not media_url:
-            raise RuntimeError("TikTok API: не вернул ссылку на видео")
+            raise RuntimeError("TikTok API: нет ссылки на видео")
         out_path = f"downloads/{vid_id}.mp4"
-        _download_file(media_url, out_path)
+        _download_direct(media_url, out_path)
         return out_path, title, duration, None
 
 
@@ -243,7 +395,6 @@ def split_image(image_path, total_parts):
     part_width = width // cols
     part_height = height // rows
     saved_files = []
-
     for row in range(rows):
         for col in range(cols):
             left = col * part_width
@@ -271,40 +422,24 @@ def calculate_auto_parts(image_path):
 def apply_tags(audio_path, cover_path, title, performer):
     out_path = os.path.splitext(audio_path)[0] + "_tagged.mp3"
     cmd = [FFMPEG_EXE_PATH, "-y", "-i", audio_path]
-
     if cover_path and os.path.exists(cover_path):
-        cmd += ["-i", cover_path]
-        cmd += [
-            "-map", "0:a", "-map", "1:v",
-            "-c:v", "mjpeg",
-            "-metadata:s:v", "title=Album cover",
-            "-metadata:s:v", "comment=Cover (front)",
-        ]
+        cmd += ["-i", cover_path, "-map", "0:a", "-map", "1:v", "-c:v", "mjpeg",
+                "-metadata:s:v", "title=Album cover",
+                "-metadata:s:v", "comment=Cover (front)"]
     else:
         cmd += ["-map", "0:a"]
-
-    cmd += [
-        "-c:a", "libmp3lame", "-b:a", "192k",
-        "-id3v2_version", "3",
-        "-metadata", f"title={title}",
-        "-metadata", f"artist={performer}",
-        out_path,
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr[-500:] if result.stderr else "ffmpeg failed")
+    cmd += ["-c:a", "libmp3lame", "-b:a", "192k", "-id3v2_version", "3",
+            "-metadata", f"title={title}", "-metadata", f"artist={performer}", out_path]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[-500:] if r.stderr else "ffmpeg failed")
     return out_path
 
 
 def get_duration(path):
     try:
-        cmd = [
-            FFPROBE_EXE_PATH, "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path,
-        ]
+        cmd = [FFPROBE_EXE_PATH, "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", path]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return float(r.stdout.strip())
     except Exception:
@@ -349,18 +484,13 @@ async def process_audio_for_tag(message: Message, state: FSMContext):
                 os.remove(p)
             except Exception:
                 pass
-
     file_info = await bot.get_file(audio.file_id)
     ext = os.path.splitext(audio.file_name or "audio.mp3")[1] or ".mp3"
     local_path = f"downloads/tag_input_{audio.file_id}{ext}"
     await bot.download_file(file_info.file_path, local_path)
-
     await state.update_data(audio_path=local_path)
     await state.set_state(BotStates.waiting_for_cover)
-    await message.answer(
-        "🖼 *Пришлите картинку звука* (обложку).\n\n"
-        "Она будет вставлена в файл как превью — Telegram покажет её в плеере."
-    )
+    await message.answer("🖼 *Пришлите картинку звука* (обложку).\n\nОна будет вставлена в файл как превью.")
 
 
 @dp.message(BotStates.waiting_for_cover, F.photo)
@@ -369,73 +499,55 @@ async def process_cover_for_audio(message: Message, state: FSMContext):
     file_info = await bot.get_file(photo.file_id)
     cover_path = f"downloads/cover_{photo.file_id}.jpg"
     await bot.download_file(file_info.file_path, cover_path)
-
     await state.update_data(cover_path=cover_path)
     await state.set_state(BotStates.waiting_for_meta)
-    await message.answer(
-        "📝 Теперь пришлите *название* и *автора* одним сообщением, разделив символом `|`:\n\n"
-        "`Название песни | Исполнитель`"
-    )
+    await message.answer("📝 Теперь пришлите *название* и *автора* через `|`:\n\n`Название | Исполнитель`")
 
 
 @dp.message(BotStates.waiting_for_cover)
 async def process_cover_wrong_type(message: Message):
-    await message.answer("🖼 Нужна именно *картинка*, пришлите фото.")
+    await message.answer("🖼 Нужна именно *картинка*.")
 
 
 @dp.message(BotStates.waiting_for_meta)
 async def process_meta_for_audio(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if "|" not in text:
-        await message.answer(
-            "❌ Не вижу разделитель `|`. Пришлите в формате:\n\n"
-            "`Название песни | Исполнитель`"
-        )
+        await message.answer("❌ Формат: `Название | Исполнитель`")
         return
-
     title, performer = [p.strip() for p in text.split("|", 1)]
     if not title:
         await message.answer("❌ Название не может быть пустым.")
         return
     if not performer:
         performer = "Unknown"
-
     data = await state.get_data()
     audio_path = data.get("audio_path")
     cover_path = data.get("cover_path")
-
     if not audio_path or not os.path.exists(audio_path):
-        await message.answer("❌ Ошибка: аудиофайл не найден. Пришлите аудио заново.")
+        await message.answer("❌ Аудиофайл не найден. Пришлите заново.")
         await state.clear()
         return
-
     status = await message.answer("⏳ Ставлю метки...")
     out_path = None
     try:
         loop = asyncio.get_event_loop()
         out_path = await loop.run_in_executor(None, apply_tags, audio_path, cover_path, title, performer)
         duration = await loop.run_in_executor(None, get_duration, out_path)
-
-        kwargs = {
-            "audio": FSInputFile(out_path, filename=f"{title}.mp3"),
-            "title": title,
-            "performer": performer,
-            "caption": "✅ Метки установлены!",
-        }
+        kwargs = {"audio": FSInputFile(out_path, filename=f"{title}.mp3"),
+                  "title": title, "performer": performer, "caption": "✅ Метки установлены!"}
         if duration:
             kwargs["duration"] = int(duration)
         if cover_path and os.path.exists(cover_path):
             kwargs["thumbnail"] = FSInputFile(cover_path)
-
         await message.answer_audio(**kwargs)
         await status.delete()
-
     except Exception as e:
         err = str(e)[:300].replace("`", "'")
         try:
-            await status.edit_text(f"❌ Ошибка при обработке:\n\n`{err}`")
+            await status.edit_text(f"❌ Ошибка:\n\n`{err}`")
         except Exception:
-            await message.answer(f"❌ Ошибка при обработке:\n\n`{err}`")
+            await message.answer(f"❌ Ошибка:\n\n`{err}`")
     finally:
         for p in (audio_path, cover_path, out_path):
             if p and os.path.exists(p):
@@ -448,10 +560,7 @@ async def process_meta_for_audio(message: Message, state: FSMContext):
 
 @dp.message(F.voice | F.video_note)
 async def reject_voice(message: Message):
-    await message.answer(
-        "❌ Голосовые сообщения и видеокружки не поддерживаются.\n\n"
-        "Отправьте *аудиофайл* (mp3, m4a, ogg и т.п.)."
-    )
+    await message.answer("❌ Голосовые и видеокружки не поддерживаются.\n\nОтправьте *аудиофайл*.")
 
 
 @dp.message(F.photo)
@@ -460,17 +569,12 @@ async def process_photo(message: Message, state: FSMContext):
     file_info = await bot.get_file(photo.file_id)
     local_path = f"temp_photos/{photo.file_id}.jpg"
     await bot.download_file(file_info.file_path, local_path)
-
     await state.update_data(photo_path=local_path)
     await state.set_state(BotStates.waiting_for_parts)
-
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Готово (Авто)", callback_data="auto_split")
-    await message.answer(
-        "На сколько частей поделить фото?\n\n"
-        "ℹ *Введите число цифрами, кратное 3 (3, 6, 9, 12...), или нажмите кнопку авто-расчета.*",
-        reply_markup=builder.as_markup()
-    )
+    await message.answer("На сколько частей поделить фото?\n\nℹ *Число кратное 3, или авто.*",
+                        reply_markup=builder.as_markup())
 
 
 @dp.callback_query(F.data == "auto_split", BotStates.waiting_for_parts)
@@ -481,14 +585,10 @@ async def process_auto_split_callback(callback: CallbackQuery, state: FSMContext
         await callback.answer("Ошибка: файл не найден.", show_alert=True)
         await state.clear()
         return
-
     await callback.message.edit_reply_markup(reply_markup=None)
     loop = asyncio.get_event_loop()
     total_parts = await loop.run_in_executor(None, calculate_auto_parts, photo_path)
-    await callback.message.answer(
-        f"🤖 *Авто-расчет:* фото будет разделено на *{total_parts}* частей "
-        f"(3 в ширину, {total_parts // 3} в длину)."
-    )
+    await callback.message.answer(f"🤖 *Авто-расчет:* *{total_parts}* частей (3×{total_parts // 3}).")
     await execute_splitting(callback.message, state, photo_path, total_parts)
     await callback.answer()
 
@@ -496,11 +596,11 @@ async def process_auto_split_callback(callback: CallbackQuery, state: FSMContext
 @dp.message(BotStates.waiting_for_parts)
 async def process_parts_count(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
-        await message.answer("Пожалуйста, отправьте число цифрами.")
+        await message.answer("Пожалуйста, число цифрами.")
         return
     total_parts = int(message.text)
     if total_parts < 3 or total_parts % 3 != 0:
-        await message.answer("❌ Число должно без остатка делиться на 3.")
+        await message.answer("❌ Число должно делиться на 3.")
         return
     user_data = await state.get_data()
     photo_path = user_data.get("photo_path")
@@ -508,7 +608,7 @@ async def process_parts_count(message: Message, state: FSMContext):
 
 
 async def execute_splitting(message_obj: Message, state: FSMContext, photo_path: str, total_parts: int):
-    status_msg = await message_obj.answer("✂ Нарезаю картинку тютелька в тютельку...")
+    status_msg = await message_obj.answer("✂ Нарезаю...")
     try:
         loop = asyncio.get_event_loop()
         parts = await loop.run_in_executor(None, split_image, photo_path, total_parts)
@@ -519,7 +619,7 @@ async def execute_splitting(message_obj: Message, state: FSMContext, photo_path:
         await status_msg.delete()
         await message_obj.answer("✅ Все фрагменты отправлены!")
     except Exception as e:
-        await message_obj.answer(f"Ошибка при обработке фото: {e}")
+        await message_obj.answer(f"Ошибка: {e}")
     finally:
         if os.path.exists(photo_path):
             os.remove(photo_path)
@@ -531,11 +631,10 @@ async def ask_media_type(message: Message, state: FSMContext):
     url = message.text.strip()
     await state.update_data(download_url=url)
     await state.set_state(BotStates.waiting_for_media_type)
-
     builder = InlineKeyboardBuilder()
     builder.button(text="🎵 Аудио (MP3)", callback_data="get_audio")
     builder.button(text="🎬 Видео (MP4)", callback_data="get_video")
-    await message.answer("Что вы хотите скачать по этой ссылке?", reply_markup=builder.as_markup())
+    await message.answer("Что скачать?", reply_markup=builder.as_markup())
 
 
 @dp.callback_query(F.data.in_({"get_audio", "get_video"}), BotStates.waiting_for_media_type)
@@ -556,185 +655,80 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
     thumb_path = None
 
     try:
-        # ============================================================
-        #       TIKTOK → через tikwm.com
-        # ============================================================
         if is_tiktok:
             try:
                 await status_msg.edit_text("📥 Скачиваю через TikTok API...")
             except Exception:
                 pass
-
-            final_filename, title, duration, _ = await loop.run_in_executor(
-                None, tiktok_via_api, url, mode
-            )
-
+            final_filename, title, duration, _ = await loop.run_in_executor(None, tiktok_via_api, url, mode)
             if not os.path.exists(final_filename):
-                raise FileNotFoundError(f"API вернул путь, но файл не найден: {final_filename}")
-
+                raise FileNotFoundError(f"Файл не найден: {final_filename}")
             if mode == "get_audio":
-                try:
-                    await status_msg.edit_text("📤 Отправляю в Telegram...")
-                except Exception:
-                    pass
-                kwargs = {
-                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
-                    'title': title,
-                    'caption': "🎵 Звуковая дорожка готова!",
-                }
+                kwargs = {'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                          'title': title, 'caption': "🎵 Звуковая дорожка готова!"}
                 if duration:
                     kwargs['duration'] = int(duration)
                 await callback.message.answer_audio(**kwargs)
             else:
-                try:
-                    await status_msg.edit_text("📤 Отправляю в Telegram...")
-                except Exception:
-                    pass
                 await callback.message.answer_video(
                     video=FSInputFile(final_filename, filename=f"{title}.mp4"),
                     caption="🎬 Видео успешно скачано!",
-                    duration=int(duration) if duration else None,
-                )
-
+                    duration=int(duration) if duration else None)
             await status_msg.delete()
             return
 
-        # ============================================================
-        #       YOUTUBE → через yt-dlp + POT-провайдер
-        # ============================================================
         if is_youtube:
             try:
-                await status_msg.edit_text("📥 Скачиваю YouTube...")
+                await status_msg.edit_text("📥 Скачиваю YouTube (перебор методов)...")
             except Exception:
                 pass
-
-            final_filename, title, duration, uploader = await loop.run_in_executor(
-                None, youtube_via_ytdlp, url, mode
-            )
-
+            final_filename, title, duration, uploader = await loop.run_in_executor(None, youtube_download, url, mode)
             if not os.path.exists(final_filename):
                 raise FileNotFoundError(f"Файл не найден: {final_filename}")
-
             if mode == "get_audio":
-                try:
-                    await status_msg.edit_text("📤 Отправляю в Telegram...")
-                except Exception:
-                    pass
-                kwargs = {
-                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
-                    'title': title,
-                    'caption': "🎵 Звуковая дорожка готова!",
-                }
+                kwargs = {'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                          'title': title, 'caption': "🎵 Звуковая дорожка готова!"}
                 if duration:
                     kwargs['duration'] = int(duration)
                 if uploader and uploader != "Unknown":
                     kwargs['performer'] = uploader
                 await callback.message.answer_audio(**kwargs)
             else:
-                try:
-                    await status_msg.edit_text("📤 Отправляю в Telegram...")
-                except Exception:
-                    pass
                 await callback.message.answer_video(
                     video=FSInputFile(final_filename, filename=f"{title}.mp4"),
                     caption="🎬 Видео успешно скачано!",
-                    duration=int(duration) if duration else None,
-                )
-
+                    duration=int(duration) if duration else None)
             await status_msg.delete()
             return
 
-        # ============================================================
-        #       ВСЁ ОСТАЛЬНОЕ (Instagram/FB/...) → через yt-dlp
-        # ============================================================
+        # === Всё остальное (Instagram/FB/...) через yt-dlp ===
         ydl_opts = {
             'outtmpl': 'downloads/%(id)s.%(ext)s',
-            'quiet': True,
-            'no_warnings': True,
-            'noprogress': True,
-            'noplaylist': True,
+            'quiet': True, 'no_warnings': True, 'noprogress': True, 'noplaylist': True,
             'ffmpeg_location': FFMPEG_DIR,
         }
-
         if mode == "get_audio":
-            ydl_opts.update({
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-            })
+            ydl_opts.update({'format': 'bestaudio/best',
+                             'postprocessors': [{'key': 'FFmpegExtractAudio',
+                                                 'preferredcodec': 'mp3', 'preferredquality': '192'}]})
         else:
-            ydl_opts.update({
-                'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
-                'merge_output_format': 'mp4',
-            })
-
-        last_edit = {"t": 0.0}
-
-        def _fmt_size(b):
-            if not b:
-                return "?"
-            for unit in ("B", "KB", "MB", "GB"):
-                if b < 1024:
-                    return f"{b:.1f}{unit}"
-                b /= 1024
-            return f"{b:.1f}TB"
-
-        def _progress_hook(d):
-            if d.get("status") != "downloading":
-                return
-            now = loop.time()
-            if now - last_edit["t"] < 1.2:
-                return
-            last_edit["t"] = now
-            pct = d.get("_percent_str", "?").strip()
-            speed = d.get("_speed_str", "?").strip()
-            eta = d.get("_eta_str", "?").strip()
-            total = _fmt_size(d.get("total_bytes") or d.get("total_bytes_estimate"))
-            done = _fmt_size(d.get("downloaded_bytes"))
-            text = (
-                f"📥 *Скачивание...*\n"
-                f"`{pct}` от `{total}`\n"
-                f"📦 Скачано: `{done}`\n"
-                f"⚡ Скорость: `{speed}`\n"
-                f"⏱ Осталось: `{eta}`"
-            )
-            asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text), loop)
-
-        ydl_opts['progress_hooks'] = [_progress_hook]
+            ydl_opts.update({'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
+                             'merge_output_format': 'mp4'})
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
             filename = ydl.prepare_filename(info)
 
-        base_path, _ = os.path.splitext(filename)
-        if mode == "get_audio":
-            candidates = [base_path + ".mp3", filename + ".mp3"]
-        else:
-            candidates = [filename, base_path + ".mp4", base_path + ".mkv", base_path + ".webm"]
-
+        base, _ = os.path.splitext(filename)
+        candidates = [base + ".mp3", filename + ".mp3"] if mode == "get_audio" else \
+                     [filename, base + ".mp4", base + ".mkv", base + ".webm"]
         final_filename = next((p for p in candidates if os.path.exists(p)), None)
         if not final_filename:
-            raise FileNotFoundError(f"Файл не найден. Ожидался один из: {candidates}")
+            raise FileNotFoundError(f"Файл не найден: {candidates}")
 
         duration = info.get('duration')
-
-        def _clean_yt(s, max_len=100):
-            if not s:
-                return ""
-            s = str(s).strip()
-            s = re.sub(r"https?://\S+", " ", s)
-            s = EMOJI_RE.sub(" ", s)
-            s = " ".join(s.split())
-            return s[:max_len].strip()
-
-        title = _clean_yt(info.get('title')) or "media"
-        performer = _clean_yt(
-            info.get('artist') or info.get('uploader')
-            or info.get('channel') or info.get('creator') or '', max_len=64
-        ) or "Unknown"
+        title = clean_meta(info.get('title') or "media")
+        performer = clean_meta(info.get('artist') or info.get('uploader') or '', max_len=64) or "Unknown"
 
         if mode == "get_audio":
             thumb_url = info.get('thumbnail')
@@ -750,46 +744,29 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
                     img = Image.open(tmp_raw).convert("RGB")
                     img.save(thumb_path, "JPEG", quality=90)
                     os.remove(tmp_raw)
-                except Exception as te:
-                    print(f"⚠ Не удалось получить обложку: {te}")
+                except Exception:
                     thumb_path = None
-
-            try:
-                await status_msg.edit_text("📤 Отправляю в Telegram...")
-            except Exception:
-                pass
-
-            kwargs = {
-                'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
-                'title': title,
-                'performer': performer,
-                'caption': "🎵 Звуковая дорожка готова!",
-            }
+            kwargs = {'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                      'title': title, 'performer': performer, 'caption': "🎵 Звуковая дорожка готова!"}
             if duration:
                 kwargs['duration'] = int(duration)
             if thumb_path and os.path.exists(thumb_path):
                 kwargs['thumbnail'] = FSInputFile(thumb_path)
             await callback.message.answer_audio(**kwargs)
         else:
-            try:
-                await status_msg.edit_text("📤 Отправляю в Telegram...")
-            except Exception:
-                pass
             await callback.message.answer_video(
                 video=FSInputFile(final_filename, filename=f"{title}.mp4"),
                 caption="🎬 Видео успешно скачано!",
-                duration=int(duration) if duration else None,
-            )
-
+                duration=int(duration) if duration else None)
         await status_msg.delete()
 
     except Exception as e:
-        print(f"Ошибка в процессе: {e}")
+        print(f"Ошибка: {e}")
         err_text = str(e)[:300].replace('`', "'")
         try:
-            await status_msg.edit_text(f"❌ Не удалось скачать медиа.\n\n`{err_text}`")
+            await status_msg.edit_text(f"❌ Не удалось скачать.\n\n`{err_text}`")
         except Exception:
-            await callback.message.answer(f"❌ Не удалось скачать медиа.\n\n`{err_text}`")
+            await callback.message.answer(f"❌ Не удалось скачать.\n\n`{err_text}`")
     finally:
         for path in (final_filename, thumb_path):
             if path and os.path.exists(path):
