@@ -108,10 +108,21 @@ def clean_meta(s, max_len=64, strip_author: str = "") -> str:
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.adminforge.de",
-    "https://api.piped.projectsegfau.lt",
+    "https://api.piped.yt",
+    "https://pipedapi.leptons.xyz",
+    "https://pipedapi.nosebs.ru",
     "https://pipedapi-libre.kavin.rocks",
+    "https://piped-api.privacy.com.de",
+    "https://pipedapi.drgns.space",
+    "https://pipedapi.owo.si",
+    "https://pipedapi.ducks.party",
+    "https://piped-api.codespace.cz",
     "https://pipedapi.reallyaweso.me",
+    "https://api.piped.private.coffee",
+    "https://pipedapi.darkness.services",
+    "https://pipedapi.orangenet.cc",
 ]
+
 
 def youtube_via_piped(url, mode):
     """Скачивает YouTube через Piped API. Возвращает (path, title, duration, uploader)."""
@@ -135,11 +146,13 @@ def youtube_via_piped(url, mode):
         try:
             api_url = f"{instance}/streams/{video_id}"
             req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with urllib.request.urlopen(req, timeout=15) as r:
                 data = json.loads(r.read().decode("utf-8", errors="ignore"))
             if data and data.get("title"):
                 print(f"✅ Piped: использован инстанс {instance}")
                 break
+            else:
+                data = None
         except Exception as e:
             last_error = e
             print(f"⚠ Piped инстанс {instance} не ответил: {e}")
@@ -187,7 +200,7 @@ def youtube_via_piped(url, mode):
                 f.write(chunk)
 
     # Если видео получилось без звука (videoOnly) — склеиваем с аудио
-    if mode == "video" and best.get("videoOnly"):
+    if mode == "video" and best and best.get("videoOnly"):
         try:
             audio_streams = data.get("audioStreams", [])
             if audio_streams:
@@ -212,8 +225,11 @@ def youtube_via_piped(url, mode):
                         "-shortest", merged,
                     ]
                     subprocess.run(cmd, capture_output=True, timeout=120)
-                    os.remove(out_path)
-                    os.remove(audio_tmp)
+                    try:
+                        os.remove(out_path)
+                        os.remove(audio_tmp)
+                    except Exception:
+                        pass
                     if os.path.exists(merged):
                         os.rename(merged, out_path)
         except Exception as e:
