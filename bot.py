@@ -103,36 +103,103 @@ def clean_meta(s, max_len=64, strip_author: str = "") -> str:
 
 
 # ============================================================
+#       YOUTUBE через публичный API Cobalt (обход блокировки IP)
+# ============================================================
+def youtube_via_cobalt(url, mode):
+    """Скачивает YouTube через Cobalt API. Возвращает (path, title, duration, cover_url)."""
+    api_url = "https://api.cobalt.tools/api/json"
+    payload = {
+        "url": url,
+        "isAudioOnly": mode == "audio",
+        "aFormat": "mp3" if mode == "audio" else "best",
+        "vQuality": "720" if mode == "video" else "max",
+        "filenamePattern": "classic",
+    }
+
+    req = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0"
+        },
+        method="POST"
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+    status = data.get("status")
+    if status == "error":
+        raise RuntimeError(f"Cobalt: {data.get('text', 'unknown error')}")
+    if status == "rate-limit":
+        raise RuntimeError("Cobalt: rate limit, попробуйте позже")
+    if status == "picker":
+        # Если видео требует выбора качества — берём первый вариант
+        picker = data.get("picker", [])
+        if not picker:
+            raise RuntimeError("Cobalt: picker пуст")
+        media_url = picker[0].get("url")
+    else:
+        media_url = data.get("url") or data.get("audio")
+
+    if not media_url:
+        raise RuntimeError("Cobalt: не вернул прямую ссылку")
+
+    # Определяем расширение
+    if mode == "audio":
+        ext = ".mp3"
+    else:
+        ext = ".mp4"
+
+    out_path = f"downloads/cobalt_{abs(hash(url)) % 10**8}{ext}"
+
+    # Скачиваем файл по прямой ссылке
+    req = urllib.request.Request(media_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        with open(out_path, "wb") as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+    # Cobalt не даёт метаданные — вытащим их через yt-dlp без скачивания
+    try:
+        info_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        title = clean_meta(info.get("title") or "youtube")
+        duration = info.get("duration")
+    except Exception:
+        title = "youtube"
+        duration = None
+
+    return out_path, title, duration, None
+
+
+# ============================================================
 #       TIKTOK через публичный API tikwm.com
 # ============================================================
 def _download_file(url, out_path, timeout=120):
-    """Качает файл по прямой ссылке с прогрессом в консоль."""
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        total = int(r.headers.get('Content-Length', 0))
-        done = 0
         with open(out_path, 'wb') as f:
             while True:
                 chunk = r.read(65536)
                 if not chunk:
                     break
                 f.write(chunk)
-                done += len(chunk)
-                if total:
-                    pct = done * 100 // total
-                    print(f"\r⬇ {pct}% ({done}/{total})", end="", flush=True)
-        print()
     return out_path
 
 
 def tiktok_via_api(url, mode):
-    """Скачивает TikTok через tikwm.com. Возвращает (path, title, duration, cover_url)."""
     api_url = f"https://tikwm.com/api/?url={urllib.parse.quote(url)}&hd=1"
     req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
     with urllib.request.urlopen(req, timeout=30) as r:
-        raw = r.read().decode('utf-8', errors='ignore')
+        data = json.loads(r.read().decode('utf-8', errors='ignore'))
 
-    data = json.loads(raw)
     if data.get('code') != 0:
         raise RuntimeError(f"TikTok API: {data.get('msg', 'unknown error')}")
 
@@ -141,9 +208,7 @@ def tiktok_via_api(url, mode):
     title = clean_meta(d.get('title') or 'tiktok')
     author = (d.get('author') or {}).get('unique_id') or ''
     duration = d.get('duration')
-    cover_url = d.get('cover') or d.get('origin_cover')
 
-    # Чистим title от ника автора в начале
     if author:
         title = clean_meta(d.get('title') or 'tiktok', strip_author=author)
 
@@ -153,8 +218,6 @@ def tiktok_via_api(url, mode):
             raise RuntimeError("TikTok API: не вернул ссылку на аудио")
         tmp_path = f"downloads/{vid_id}_audio_raw"
         _download_file(media_url, tmp_path)
-
-        # Конвертируем в mp3 через ffmpeg (если исходник не mp3)
         out_path = f"downloads/{vid_id}.mp3"
         cmd = [
             FFMPEG_EXE_PATH, "-y", "-i", tmp_path,
@@ -168,11 +231,8 @@ def tiktok_via_api(url, mode):
             pass
         if r.returncode != 0:
             raise RuntimeError(f"ffmpeg: {r.stderr[-300:] if r.stderr else 'unknown'}")
-
         return out_path, title, duration, None
-
-    else:  # video
-        # play — без водяного знака, hdplay — HD без водяного знака
+    else:
         media_url = d.get('hdplay') or d.get('play')
         if not media_url:
             raise RuntimeError("TikTok API: не вернул ссылку на видео")
@@ -499,13 +559,14 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
 
     loop = asyncio.get_event_loop()
     is_tiktok = "tiktok.com" in url or "vm.tiktok.com" in url or "vt.tiktok.com" in url
+    is_youtube = "youtube.com" in url or "youtu.be" in url
 
     final_filename = None
     thumb_path = None
 
     try:
         # ============================================================
-        #       TIKTOK → через публичный API (обходит блокировку IP)
+        #       TIKTOK → через tikwm.com
         # ============================================================
         if is_tiktok:
             try:
@@ -545,10 +606,53 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
                 )
 
             await status_msg.delete()
-            return  # Выходим, TikTok обработан
+            return
 
         # ============================================================
-        #       ВСЁ ОСТАЛЬНОЕ (YouTube/IG/FB/...) → через yt-dlp
+        #       YOUTUBE → через Cobalt API
+        # ============================================================
+        if is_youtube:
+            try:
+                await status_msg.edit_text("📥 Скачиваю через YouTube API...")
+            except Exception:
+                pass
+
+            final_filename, title, duration, _ = await loop.run_in_executor(
+                None, youtube_via_cobalt, url, mode
+            )
+
+            if not os.path.exists(final_filename):
+                raise FileNotFoundError(f"API вернул путь, но файл не найден: {final_filename}")
+
+            if mode == "get_audio":
+                try:
+                    await status_msg.edit_text("📤 Отправляю в Telegram...")
+                except Exception:
+                    pass
+                kwargs = {
+                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                    'title': title,
+                    'caption': "🎵 Звуковая дорожка готова!",
+                }
+                if duration:
+                    kwargs['duration'] = int(duration)
+                await callback.message.answer_audio(**kwargs)
+            else:
+                try:
+                    await status_msg.edit_text("📤 Отправляю в Telegram...")
+                except Exception:
+                    pass
+                await callback.message.answer_video(
+                    video=FSInputFile(final_filename, filename=f"{title}.mp4"),
+                    caption="🎬 Видео успешно скачано!",
+                    duration=int(duration) if duration else None,
+                )
+
+            await status_msg.delete()
+            return
+
+        # ============================================================
+        #       ВСЁ ОСТАЛЬНОЕ (Instagram/FB/...) → через yt-dlp
         # ============================================================
         ydl_opts = {
             'outtmpl': 'downloads/%(id)s.%(ext)s',
@@ -558,9 +662,6 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
             'noplaylist': True,
             'ffmpeg_location': FFMPEG_DIR,
         }
-
-        if "youtube.com" in url or "youtu.be" in url:
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': 'android,web'}}
 
         if mode == "get_audio":
             ydl_opts.update({
@@ -627,7 +728,6 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
 
         duration = info.get('duration')
 
-        # Метаданные для YouTube/IG/FB
         def _clean_yt(s, max_len=100):
             if not s:
                 return ""
@@ -644,7 +744,6 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
         ) or "Unknown"
 
         if mode == "get_audio":
-            # Скачиваем обложку для YouTube/IG/FB
             thumb_url = info.get('thumbnail')
             if thumb_url:
                 try:
