@@ -103,156 +103,66 @@ def clean_meta(s, max_len=64, strip_author: str = "") -> str:
 
 
 # ============================================================
-#       YOUTUBE через Piped API (обход блокировки IP)
+#       YOUTUBE через yt-dlp с маскировкой под TV-клиент
 # ============================================================
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
-    "https://pipedapi.leptons.xyz",
-    "https://pipedapi.nosebs.ru",
-    "https://pipedapi-libre.kavin.rocks",
-    "https://piped-api.privacy.com.de",
-    "https://pipedapi.drgns.space",
-    "https://pipedapi.owo.si",
-    "https://pipedapi.ducks.party",
-    "https://piped-api.codespace.cz",
-    "https://pipedapi.reallyaweso.me",
-    "https://api.piped.private.coffee",
-    "https://pipedapi.darkness.services",
-    "https://pipedapi.orangenet.cc",
-]
+def youtube_via_ytdlp(url, mode):
+    """Скачивает YouTube через yt-dlp с маскировкой под TV-клиент."""
+    ydl_opts = {
+        'outtmpl': 'downloads/%(id)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'noprogress': True,
+        'noplaylist': True,
+        'ffmpeg_location': FFMPEG_DIR,
+        # Маскировка под TV-клиент YouTube — обходит блокировку "Sign in to confirm"
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['tv', 'mweb', 'web_safari', 'android_vr'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
+        },
+    }
 
-
-def youtube_via_piped(url, mode):
-    """Скачивает YouTube через Piped API. Возвращает (path, title, duration, uploader)."""
-    video_id = None
-    if "youtu.be/" in url:
-        video_id = url.split("youtu.be/")[1].split("?")[0].split("&")[0]
-    elif "youtube.com/watch" in url:
-        parsed = urllib.parse.urlparse(url)
-        qs = urllib.parse.parse_qs(parsed.query)
-        video_id = qs.get("v", [None])[0]
-    elif "youtube.com/shorts/" in url:
-        video_id = url.split("youtube.com/shorts/")[1].split("?")[0].split("&")[0]
-
-    if not video_id:
-        raise RuntimeError("Не удалось определить ID видео из ссылки")
-
-    last_error = None
-    data = None
-
-    for instance in PIPED_INSTANCES:
-        try:
-            api_url = f"{instance}/streams/{video_id}"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = json.loads(r.read().decode("utf-8", errors="ignore"))
-            if data and data.get("title"):
-                print(f"✅ Piped: использован инстанс {instance}")
-                break
-            else:
-                data = None
-        except Exception as e:
-            last_error = e
-            print(f"⚠ Piped инстанс {instance} не ответил: {e}")
-            continue
-
-    if not data or not data.get("title"):
-        raise RuntimeError(f"Все Piped инстансы недоступны. Последняя ошибка: {last_error}")
-
-    title = clean_meta(data.get("title") or "youtube")
-    duration = data.get("duration")
-    uploader = data.get("uploader") or ""
-
-    best = None
     if mode == "audio":
-        streams = data.get("audioStreams", [])
-        if not streams:
-            raise RuntimeError("Piped: нет аудио-потоков")
-        best = max(streams, key=lambda s: s.get("bitrate", 0) or 0)
-        media_url = best.get("url")
-        ext = ".m4a"
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        })
     else:
-        streams = data.get("videoStreams", [])
-        if not streams:
-            raise RuntimeError("Piped: нет видео-потоков")
-        with_audio = [s for s in streams if s.get("videoOnly") is False]
-        if with_audio:
-            best = max(with_audio, key=lambda s: s.get("height", 0) or 0)
-        else:
-            best = max(streams, key=lambda s: s.get("height", 0) or 0)
-        media_url = best.get("url")
-        ext = ".mp4"
+        ydl_opts.update({
+            'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
+            'merge_output_format': 'mp4',
+        })
 
-    if not media_url:
-        raise RuntimeError("Piped: не удалось получить прямую ссылку")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
 
-    out_path = f"downloads/piped_{video_id}{ext}"
-
-    req = urllib.request.Request(media_url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        with open(out_path, "wb") as f:
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-
-    # Если видео получилось без звука (videoOnly) — склеиваем с аудио
-    if mode == "video" and best and best.get("videoOnly"):
-        try:
-            audio_streams = data.get("audioStreams", [])
-            if audio_streams:
-                best_audio = max(audio_streams, key=lambda s: s.get("bitrate", 0) or 0)
-                audio_url = best_audio.get("url")
-                if audio_url:
-                    audio_tmp = f"downloads/piped_{video_id}_audio.m4a"
-                    req_a = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req_a, timeout=120) as ra:
-                        with open(audio_tmp, "wb") as fa:
-                            while True:
-                                chunk = ra.read(65536)
-                                if not chunk:
-                                    break
-                                fa.write(chunk)
-                    merged = f"downloads/piped_{video_id}_merged.mp4"
-                    cmd = [
-                        FFMPEG_EXE_PATH, "-y",
-                        "-i", out_path,
-                        "-i", audio_tmp,
-                        "-c:v", "copy", "-c:a", "aac",
-                        "-shortest", merged,
-                    ]
-                    subprocess.run(cmd, capture_output=True, timeout=120)
-                    try:
-                        os.remove(out_path)
-                        os.remove(audio_tmp)
-                    except Exception:
-                        pass
-                    if os.path.exists(merged):
-                        os.rename(merged, out_path)
-        except Exception as e:
-            print(f"⚠ Не удалось склеить видео+аудио: {e}")
-
-    # Если аудио — конвертируем в mp3
+    base_path, _ = os.path.splitext(filename)
     if mode == "audio":
-        mp3_path = f"downloads/piped_{video_id}.mp3"
-        cmd = [
-            FFMPEG_EXE_PATH, "-y", "-i", out_path,
-            "-vn", "-c:a", "libmp3lame", "-b:a", "192k",
-            mp3_path,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
-        if r.returncode != 0:
-            raise RuntimeError(f"ffmpeg: {r.stderr[-300:] if r.stderr else 'unknown'}")
-        out_path = mp3_path
+        candidates = [base_path + ".mp3", filename + ".mp3"]
+    else:
+        candidates = [filename, base_path + ".mp4", base_path + ".mkv", base_path + ".webm"]
 
-    return out_path, title, duration, uploader
+    final_filename = next((p for p in candidates if os.path.exists(p)), None)
+    if not final_filename:
+        raise FileNotFoundError(f"Файл не найден: {candidates}")
+
+    title = clean_meta(info.get('title') or 'youtube')
+    performer = clean_meta(
+        info.get('uploader') or info.get('channel') or info.get('artist') or '',
+        max_len=64
+    ) or "Unknown"
+    duration = info.get('duration')
+
+    return final_filename, title, duration, performer
 
 
 # ============================================================
@@ -685,22 +595,23 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
             return
 
         # ============================================================
-        #       YOUTUBE → через Piped API
+        #       YOUTUBE → через yt-dlp с маскировкой под TV
         # ============================================================
         if is_youtube:
             try:
-                await status_msg.edit_text("📥 Скачиваю через YouTube API...")
+                await status_msg.edit_text("📥 Скачиваю YouTube...")
             except Exception:
                 pass
 
             final_filename, title, duration, uploader = await loop.run_in_executor(
-                None, youtube_via_piped, url, mode
+                None, youtube_via_ytdlp, url, mode
             )
 
             if not os.path.exists(final_filename):
-                raise FileNotFoundError(f"API вернул путь, но файл не найден: {final_filename}")
+                raise FileNotFoundError(f"Файл не найден: {final_filename}")
 
             if mode == "get_audio":
+                # Обложка из thumbnail напрямую (у нас нет info из executor)
                 try:
                     await status_msg.edit_text("📤 Отправляю в Telegram...")
                 except Exception:
@@ -712,8 +623,8 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
                 }
                 if duration:
                     kwargs['duration'] = int(duration)
-                if uploader:
-                    kwargs['performer'] = clean_meta(uploader, max_len=64)
+                if uploader and uploader != "Unknown":
+                    kwargs['performer'] = uploader
                 await callback.message.answer_audio(**kwargs)
             else:
                 try:
