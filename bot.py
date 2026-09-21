@@ -103,10 +103,13 @@ def clean_meta(s, max_len=64, strip_author: str = "") -> str:
 
 
 # ============================================================
-#       YOUTUBE через yt-dlp с маскировкой под TV-клиент
+#       YOUTUBE через yt-dlp + bgutil-ytdlp-pot-provider
 # ============================================================
 def youtube_via_ytdlp(url, mode):
-    """Скачивает YouTube через yt-dlp с маскировкой под TV-клиент."""
+    """
+    Скачивает YouTube через yt-dlp с плагином bgutil-ytdlp-pot-provider.
+    Плагин генерирует proof-of-origin токены (POT) для обхода блокировки.
+    """
     ydl_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'quiet': True,
@@ -114,13 +117,15 @@ def youtube_via_ytdlp(url, mode):
         'noprogress': True,
         'noplaylist': True,
         'ffmpeg_location': FFMPEG_DIR,
-        # Маскировка под TV-клиент YouTube — обходит блокировку "Sign in to confirm"
+        # Используем TV-клиент и отключаем лишние запросы — POT-провайдер
+        # автоматически генерирует токены для обхода "Sign in to confirm"
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv', 'mweb', 'web_safari', 'android_vr'],
+                'player_client': ['tv', 'mweb'],
                 'player_skip': ['webpage', 'configs'],
             }
         },
+        # Маскировка под Safari
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15',
         },
@@ -595,7 +600,7 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
             return
 
         # ============================================================
-        #       YOUTUBE → через yt-dlp с маскировкой под TV
+        #       YOUTUBE → через yt-dlp + POT-провайдер
         # ============================================================
         if is_youtube:
             try:
@@ -611,7 +616,6 @@ async def process_download(callback: CallbackQuery, state: FSMContext):
                 raise FileNotFoundError(f"Файл не найден: {final_filename}")
 
             if mode == "get_audio":
-                # Обложка из thumbnail напрямую (у нас нет info из executor)
                 try:
                     await status_msg.edit_text("📤 Отправляю в Telegram...")
                 except Exception:
