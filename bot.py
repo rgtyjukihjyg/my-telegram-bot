@@ -3,14 +3,12 @@ import re
 import asyncio
 import urllib.request
 import subprocess
-from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, CallbackQuery
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from PIL import Image
 import yt_dlp
 from static_ffmpeg import run as static_ffmpeg_run
@@ -20,25 +18,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("❌ Не задана переменная окружения BOT_TOKEN")
 
-# --- Настройки для вебхука ---
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_PATH = "/webhook"
-
-# URL, который будет сгенерирован автоматически на Fly.io
-# Если тестируешь локально, можешь временно указать свой ngrok-адрес
-BASE_WEBHOOK_URL = os.environ.get("WEBHOOK_URL", f"https://{os.environ.get('FLY_APP_NAME', 'localhost')}.fly.dev")
-
-# Таймаут бездействия в секундах (5 минут)
-INACTIVITY_TIMEOUT = 300
-
-# --- Инициализация ---
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
-
-# Глобальные переменные для отслеживания активности
-last_activity = asyncio.get_event_loop().time()
-shutdown_task = None
 
 class BotStates(StatesGroup):
     waiting_for_parts = State()
@@ -49,6 +30,21 @@ class BotStates(StatesGroup):
 os.makedirs("downloads", exist_ok=True)
 os.makedirs("temp_photos", exist_ok=True)
 
+# --- Чистка папок при старте (автоочистка от мусора прошлых запусков) ---
+def _cleanup_folder(folder):
+    if os.path.exists(folder):
+        for f in os.listdir(folder):
+            path = os.path.join(folder, f)
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception as e:
+                print(f"⚠ Не удалось удалить {path}: {e}")
+
+_cleanup_folder("downloads")
+_cleanup_folder("temp_photos")
+print("🧹 Временные папки очищены")
+
 # --- FFMPEG через static-ffmpeg ---
 print("🔧 Проверяю ffmpeg / ffprobe...")
 FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
@@ -58,50 +54,176 @@ print(f"✅ ffprobe: {FFPROBE_EXE_PATH}")
 
 
 # ============================================================
-#         УТИЛИТЫ ДЛЯ РАБОТЫ С АВТО-ВЫКЛЮЧЕНИЕМ
+#         УТИЛИТЫ ЧИСТКИ МЕТАДАННЫХ
 # ============================================================
-def update_activity():
-    """Обновляет время последней активности."""
-    global last_activity
-    last_activity = asyncio.get_event_loop().time()
-    print(f"🕒 Активность обновлена. Выключение через {INACTIVITY_TIMEOUT} сек. простоя.")
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F000-\U0001F2FF"
+    "\U0001F900-\U0001F9FF"
+    "\U00002700-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U0001FA00-\U0001FAFF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+DASH_RE = re.compile(r"\s*[-–—−―]\s*")
 
 
-async def shutdown_if_idle():
-    """Проверяет бездействие и выключает приложение."""
-    global shutdown_task
-    await asyncio.sleep(INACTIVITY_TIMEOUT)
-    
-    current_time = asyncio.get_event_loop().time()
-    idle_time = current_time - last_activity
-    
-    if idle_time >= INACTIVITY_TIMEOUT:
-        print(f"💤 Простой {idle_time:.0f} сек. Выключаюсь...")
-        # Отправляем сигнал на завершение работы aiohttp сервера
-        # Это корректно завершит процесс на Fly.io
-        os.kill(os.getpid(), 15)  # SIGTERM
+def clean_meta(s, max_len=64, strip_author: str = "") -> str:
+    if not s:
+        return ""
+    s = str(s).strip()
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"#\S+", " ", s)
+    s = re.sub(r"@\S+", " ", s)
+    s = re.sub(r"\btiktok\b", " ", s, flags=re.IGNORECASE)
+    s = EMOJI_RE.sub(" ", s)
+    s = " ".join(s.split())
+
+    if strip_author:
+        author_clean = strip_author.strip().lower()
+        for _ in range(3):
+            low = s.lower()
+            if low.startswith(author_clean):
+                s = s[len(author_clean):].lstrip(" -–—−|.,:;·•»«\"'")
+            else:
+                break
+
+    parts = DASH_RE.split(s, maxsplit=1)
+    if len(parts) == 2 and len(parts[0].split()) >= 1 and len(parts[1].split()) >= 1:
+        s = parts[0] if len(parts[0]) >= len(parts[1]) else parts[1]
+
+    s = s.strip(" -–—−|.,:;·•»«\"'")
+    s = " ".join(s.split())
+    return s[:max_len].strip()
+
+
+def extract_metadata(info: dict):
+    extractor = (info.get('extractor_key') or info.get('extractor') or '').lower()
+
+    if 'tiktok' in extractor:
+        raw_uploader = (
+            info.get('uploader') or info.get('creator') or info.get('channel') or ''
+        )
+        performer = clean_meta(raw_uploader, max_len=64) or "TikTok"
+
+        track = clean_meta(info.get('track'), max_len=64)
+        junk_tracks = {
+            "original sound", "оригинальный звук",
+            "original sound tiktok", "оригинальный звук tiktok",
+            "original music", "оригинальная музыка",
+        }
+        track_ok = (
+            track
+            and track.lower().strip() not in junk_tracks
+            and not track.lower().startswith("original sound")
+            and not track.lower().startswith("оригинальный звук")
+        )
+
+        if track_ok:
+            title = track
+        else:
+            title = clean_meta(info.get('title'), max_len=64, strip_author=performer)
+            if not title:
+                title = performer
+
+        return title, performer
+
+    title = clean_meta(info.get('title'), max_len=100) or "audio"
+    performer = clean_meta(
+        info.get('artist') or info.get('uploader') or info.get('channel')
+        or info.get('creator') or '', max_len=64,
+    ) or "Unknown"
+    return title, performer
+
+
+# ============================================================
+#                     НАРЕЗКА ФОТО
+# ============================================================
+def split_image(image_path, total_parts):
+    img = Image.open(image_path)
+    width, height = img.size
+    cols = 3
+    rows = total_parts // cols
+    part_width = width // cols
+    part_height = height // rows
+    saved_files = []
+
+    for row in range(rows):
+        for col in range(cols):
+            left = col * part_width
+            top = row * part_height
+            right = (col + 1) * part_width if col < cols - 1 else width
+            bottom = (row + 1) * part_height if row < rows - 1 else height
+            cropped = img.crop((left, top, right, bottom))
+            filename = f"temp_photos/part_{row}_{col}.jpg"
+            cropped.save(filename, "JPEG", quality=95)
+            saved_files.append(filename)
+    return saved_files
+
+
+def calculate_auto_parts(image_path):
+    img = Image.open(image_path)
+    width, height = img.size
+    target_part_width = width / 3
+    rows = max(1, round(height / target_part_width))
+    return rows * 3
+
+
+# ============================================================
+#         АУДИО: тегирование
+# ============================================================
+def apply_tags(audio_path, cover_path, title, performer):
+    out_path = os.path.splitext(audio_path)[0] + "_tagged.mp3"
+    cmd = [FFMPEG_EXE_PATH, "-y", "-i", audio_path]
+
+    if cover_path and os.path.exists(cover_path):
+        cmd += ["-i", cover_path]
+        cmd += [
+            "-map", "0:a", "-map", "1:v",
+            "-c:v", "mjpeg",
+            "-metadata:s:v", "title=Album cover",
+            "-metadata:s:v", "comment=Cover (front)",
+        ]
     else:
-        # Если активность была, перезапускаем таймер
-        remaining = INACTIVITY_TIMEOUT - idle_time
-        print(f"🔄 Таймер сброшен. Осталось {remaining:.0f} сек.")
-        shutdown_task = asyncio.create_task(shutdown_if_idle())
+        cmd += ["-map", "0:a"]
+
+    cmd += [
+        "-c:a", "libmp3lame", "-b:a", "192k",
+        "-id3v2_version", "3",
+        "-metadata", f"title={title}",
+        "-metadata", f"artist={performer}",
+        out_path,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-500:] if result.stderr else "ffmpeg failed")
+    return out_path
 
 
-def start_shutdown_timer():
-    """Запускает или перезапускает таймер выключения."""
-    global shutdown_task
-    if shutdown_task and not shutdown_task.done():
-        shutdown_task.cancel()
-    shutdown_task = asyncio.create_task(shutdown_if_idle())
+def get_duration(path):
+    try:
+        cmd = [
+            FFPROBE_EXE_PATH, "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return float(r.stdout.strip())
+    except Exception:
+        return None
 
 
 # ============================================================
-#                     ХЕНДЛЕРЫ (с обновлением активности)
+#                     ХЕНДЛЕРЫ
 # ============================================================
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    update_activity()
-    start_shutdown_timer()
     await message.answer(
         "👋 Привет! Я умею три вещи:\n\n"
         "📷 *Отправь фото* — разрежу на части 3×N\n"
@@ -110,94 +232,412 @@ async def cmd_start(message: Message):
     )
 
 
-# ... (остальные хендлеры: process_audio_for_tag, process_cover_for_audio, и т.д.)
-# ВАЖНО: В каждом хендлере, который получает сообщение от пользователя,
-# нужно добавить в начале две строки:
-#     update_activity()
-#     start_shutdown_timer()
-# Я добавлю их в самые важные хендлеры для примера, но ты должен добавить их во все.
+@dp.message(F.text == "/cancel")
+async def cmd_cancel(message: Message, state: FSMContext):
+    data = await state.get_data()
+    for key in ("audio_path", "cover_path", "photo_path"):
+        p = data.get(key)
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    await state.clear()
+    await message.answer("✅ Отменено.")
+
 
 @dp.message(F.audio)
 async def process_audio_for_tag(message: Message, state: FSMContext):
-    update_activity()
-    start_shutdown_timer()
-    # ... (дальнейший код без изменений)
     audio = message.audio
-    # ... и так далее
+    old = await state.get_data()
+    for key in ("audio_path", "cover_path"):
+        p = old.get(key)
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+    file_info = await bot.get_file(audio.file_id)
+    ext = os.path.splitext(audio.file_name or "audio.mp3")[1] or ".mp3"
+    local_path = f"downloads/tag_input_{audio.file_id}{ext}"
+    await bot.download_file(file_info.file_path, local_path)
+
+    await state.update_data(audio_path=local_path)
+    await state.set_state(BotStates.waiting_for_cover)
+    await message.answer(
+        "🖼 *Пришлите картинку звука* (обложку).\n\n"
+        "Она будет вставлена в файл как превью — Telegram покажет её в плеере."
+    )
+
+
+@dp.message(BotStates.waiting_for_cover, F.photo)
+async def process_cover_for_audio(message: Message, state: FSMContext):
+    photo = message.photo[-1]
+    file_info = await bot.get_file(photo.file_id)
+    cover_path = f"downloads/cover_{photo.file_id}.jpg"
+    await bot.download_file(file_info.file_path, cover_path)
+
+    await state.update_data(cover_path=cover_path)
+    await state.set_state(BotStates.waiting_for_meta)
+    await message.answer(
+        "📝 Теперь пришлите *название* и *автора* одним сообщением, разделив символом `|`:\n\n"
+        "`Название песни | Исполнитель`"
+    )
+
+
+@dp.message(BotStates.waiting_for_cover)
+async def process_cover_wrong_type(message: Message):
+    await message.answer("🖼 Нужна именно *картинка*, пришлите фото.")
+
+
+@dp.message(BotStates.waiting_for_meta)
+async def process_meta_for_audio(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if "|" not in text:
+        await message.answer(
+            "❌ Не вижу разделитель `|`. Пришлите в формате:\n\n"
+            "`Название песни | Исполнитель`"
+        )
+        return
+
+    title, performer = [p.strip() for p in text.split("|", 1)]
+    if not title:
+        await message.answer("❌ Название не может быть пустым.")
+        return
+    if not performer:
+        performer = "Unknown"
+
+    data = await state.get_data()
+    audio_path = data.get("audio_path")
+    cover_path = data.get("cover_path")
+
+    if not audio_path or not os.path.exists(audio_path):
+        await message.answer("❌ Ошибка: аудиофайл не найден. Пришлите аудио заново.")
+        await state.clear()
+        return
+
+    status = await message.answer("⏳ Ставлю метки...")
+    out_path = None
+    try:
+        loop = asyncio.get_event_loop()
+        out_path = await loop.run_in_executor(None, apply_tags, audio_path, cover_path, title, performer)
+        duration = await loop.run_in_executor(None, get_duration, out_path)
+
+        kwargs = {
+            "audio": FSInputFile(out_path, filename=f"{title}.mp3"),
+            "title": title,
+            "performer": performer,
+            "caption": "✅ Метки установлены!",
+        }
+        if duration:
+            kwargs["duration"] = int(duration)
+        if cover_path and os.path.exists(cover_path):
+            kwargs["thumbnail"] = FSInputFile(cover_path)
+
+        await message.answer_audio(**kwargs)
+        await status.delete()
+
+    except Exception as e:
+        err = str(e)[:300].replace("`", "'")
+        try:
+            await status.edit_text(f"❌ Ошибка при обработке:\n\n`{err}`")
+        except Exception:
+            await message.answer(f"❌ Ошибка при обработке:\n\n`{err}`")
+    finally:
+        for p in (audio_path, cover_path, out_path):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        await state.clear()
+
+
+@dp.message(F.voice | F.video_note)
+async def reject_voice(message: Message):
+    await message.answer(
+        "❌ Голосовые сообщения и видеокружки не поддерживаются.\n\n"
+        "Отправьте *аудиофайл* (mp3, m4a, ogg и т.п.)."
+    )
 
 
 @dp.message(F.photo)
 async def process_photo(message: Message, state: FSMContext):
-    update_activity()
-    start_shutdown_timer()
-    # ... (дальнейший код без изменений)
     photo = message.photo[-1]
-    # ... и так далее
+    file_info = await bot.get_file(photo.file_id)
+    local_path = f"temp_photos/{photo.file_id}.jpg"
+    await bot.download_file(file_info.file_path, local_path)
+
+    await state.update_data(photo_path=local_path)
+    await state.set_state(BotStates.waiting_for_parts)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Готово (Авто)", callback_data="auto_split")
+    await message.answer(
+        "На сколько частей поделить фото?\n\n"
+        "ℹ *Введите число цифрами, кратное 3 (3, 6, 9, 12...), или нажмите кнопку авто-расчета.*",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "auto_split", BotStates.waiting_for_parts)
+async def process_auto_split_callback(callback: CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    photo_path = user_data.get("photo_path")
+    if not photo_path or not os.path.exists(photo_path):
+        await callback.answer("Ошибка: файл не найден.", show_alert=True)
+        await state.clear()
+        return
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    loop = asyncio.get_event_loop()
+    total_parts = await loop.run_in_executor(None, calculate_auto_parts, photo_path)
+    await callback.message.answer(
+        f"🤖 *Авто-расчет:* фото будет разделено на *{total_parts}* частей "
+        f"(3 в ширину, {total_parts // 3} в длину)."
+    )
+    await execute_splitting(callback.message, state, photo_path, total_parts)
+    await callback.answer()
+
+
+@dp.message(BotStates.waiting_for_parts)
+async def process_parts_count(message: Message, state: FSMContext):
+    if not message.text or not message.text.isdigit():
+        await message.answer("Пожалуйста, отправьте число цифрами.")
+        return
+    total_parts = int(message.text)
+    if total_parts < 3 or total_parts % 3 != 0:
+        await message.answer("❌ Число должно без остатка делиться на 3.")
+        return
+    user_data = await state.get_data()
+    photo_path = user_data.get("photo_path")
+    await execute_splitting(message, state, photo_path, total_parts)
+
+
+async def execute_splitting(message_obj: Message, state: FSMContext, photo_path: str, total_parts: int):
+    status_msg = await message_obj.answer("✂ Нарезаю картинку тютелька в тютельку...")
+    try:
+        loop = asyncio.get_event_loop()
+        parts = await loop.run_in_executor(None, split_image, photo_path, total_parts)
+        for part_file in parts:
+            if os.path.exists(part_file):
+                await message_obj.answer_photo(FSInputFile(part_file))
+                os.remove(part_file)
+        await status_msg.delete()
+        await message_obj.answer("✅ Все фрагменты отправлены!")
+    except Exception as e:
+        await message_obj.answer(f"Ошибка при обработке фото: {e}")
+    finally:
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
+        await state.clear()
 
 
 @dp.message(F.text.contains("http://") | F.text.contains("https://"))
 async def ask_media_type(message: Message, state: FSMContext):
-    update_activity()
-    start_shutdown_timer()
-    # ... (дальнейший код без изменений)
     url = message.text.strip()
-    # ... и так далее
+    await state.update_data(download_url=url)
+    await state.set_state(BotStates.waiting_for_media_type)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎵 Аудио (MP3)", callback_data="get_audio")
+    builder.button(text="🎬 Видео (MP4)", callback_data="get_video")
+    await message.answer("Что вы хотите скачать по этой ссылке?", reply_markup=builder.as_markup())
 
 
 @dp.callback_query(F.data.in_({"get_audio", "get_video"}), BotStates.waiting_for_media_type)
 async def process_download(callback: CallbackQuery, state: FSMContext):
-    update_activity()
-    start_shutdown_timer()
-    # ... (дальнейший код без изменений)
     user_data = await state.get_data()
-    # ... и так далее
+    url = user_data.get("download_url")
+    mode = callback.data
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    status_msg = await callback.message.answer("⏳ Подключаюсь к источнику...")
+    await callback.answer()
+
+    ydl_opts = {
+        'outtmpl': 'downloads/%(id)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'noprogress': True,
+        'noplaylist': True,
+        'ffmpeg_location': FFMPEG_DIR,
+    }
+
+    if "youtube.com" in url or "youtu.be" in url:
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': 'android,web'}}
+
+    if mode == "get_audio":
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        })
+    else:
+        ydl_opts.update({
+            'format': 'best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best',
+            'merge_output_format': 'mp4',
+        })
+
+    loop = asyncio.get_event_loop()
+    last_edit = {"t": 0.0}
+
+    def _fmt_size(b):
+        if not b:
+            return "?"
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024:
+                return f"{b:.1f}{unit}"
+            b /= 1024
+        return f"{b:.1f}TB"
+
+    def _progress_hook(d):
+        if d.get("status") != "downloading":
+            return
+        now = loop.time()
+        if now - last_edit["t"] < 1.2:
+            return
+        last_edit["t"] = now
+        pct = d.get("_percent_str", "?").strip()
+        speed = d.get("_speed_str", "?").strip()
+        eta = d.get("_eta_str", "?").strip()
+        total = _fmt_size(d.get("total_bytes") or d.get("total_bytes_estimate"))
+        done = _fmt_size(d.get("downloaded_bytes"))
+        text = (
+            f"📥 *Скачивание...*\n"
+            f"`{pct}` от `{total}`\n"
+            f"📦 Скачано: `{done}`\n"
+            f"⚡ Скорость: `{speed}`\n"
+            f"⏱ Осталось: `{eta}`"
+        )
+        asyncio.run_coroutine_threadsafe(_safe_edit(status_msg, text), loop)
+
+    ydl_opts['progress_hooks'] = [_progress_hook]
+
+    final_filename = None
+    thumb_path = None
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+            filename = ydl.prepare_filename(info)
+
+        base_path, _ = os.path.splitext(filename)
+        if mode == "get_audio":
+            candidates = [base_path + ".mp3", filename + ".mp3"]
+        else:
+            candidates = [filename, base_path + ".mp4", base_path + ".mkv", base_path + ".webm"]
+
+        final_filename = next((p for p in candidates if os.path.exists(p)), None)
+        if not final_filename:
+            raise FileNotFoundError(f"Файл не найден. Ожидался один из: {candidates}")
+
+        duration = info.get('duration')
+        extractor = (info.get('extractor_key') or info.get('extractor') or '').lower()
+        is_tiktok = 'tiktok' in extractor
+
+        title, performer = extract_metadata(info)
+        print(f"🎵 [{extractor}] tiktok={is_tiktok} title={title!r} performer={performer!r}")
+
+        if mode == "get_audio":
+            if is_tiktok:
+                try:
+                    await status_msg.edit_text("📤 Отправляю в Telegram...")
+                except Exception:
+                    pass
+                kwargs = {
+                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                    'title': title,
+                    'caption': "🎵 Звуковая дорожка готова!",
+                }
+                if duration:
+                    kwargs['duration'] = int(duration)
+                await callback.message.answer_audio(**kwargs)
+            else:
+                thumb_url = info.get('thumbnail')
+                if thumb_url:
+                    try:
+                        thumb_path = f"downloads/{info['id']}_thumb.jpg"
+                        req = urllib.request.Request(thumb_url, headers={'User-Agent': 'Mozilla/5.0'})
+                        with urllib.request.urlopen(req, timeout=15) as r:
+                            data = r.read()
+                        tmp_raw = f"downloads/{info['id']}_thumb_raw"
+                        with open(tmp_raw, 'wb') as f:
+                            f.write(data)
+                        img = Image.open(tmp_raw).convert("RGB")
+                        img.save(thumb_path, "JPEG", quality=90)
+                        os.remove(tmp_raw)
+                    except Exception as te:
+                        print(f"⚠ Не удалось получить обложку: {te}")
+                        thumb_path = None
+
+                try:
+                    await status_msg.edit_text("📤 Отправляю в Telegram...")
+                except Exception:
+                    pass
+
+                kwargs = {
+                    'audio': FSInputFile(final_filename, filename=f"{title}.mp3"),
+                    'title': title,
+                    'performer': performer,
+                    'caption': "🎵 Звуковая дорожка готова!",
+                }
+                if duration:
+                    kwargs['duration'] = int(duration)
+                if thumb_path and os.path.exists(thumb_path):
+                    kwargs['thumbnail'] = FSInputFile(thumb_path)
+                await callback.message.answer_audio(**kwargs)
+        else:
+            try:
+                await status_msg.edit_text("📤 Отправляю в Telegram...")
+            except Exception:
+                pass
+            video_file = FSInputFile(final_filename, filename=f"{title}.mp4")
+            await callback.message.answer_video(
+                video=video_file,
+                caption="🎬 Видео успешно скачано!",
+                duration=int(duration) if duration else None,
+            )
+
+        await status_msg.delete()
+
+    except Exception as e:
+        print(f"Ошибка в процессе: {e}")
+        err_text = str(e)[:300].replace('`', "'")
+        try:
+            await status_msg.edit_text(f"❌ Не удалось скачать медиа.\n\n`{err_text}`")
+        except Exception:
+            await callback.message.answer(f"❌ Не удалось скачать медиа.\n\n`{err_text}`")
+    finally:
+        for path in (final_filename, thumb_path):
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        await state.clear()
 
 
-# ... (и так для всех остальных хендлеров)
+async def _safe_edit(msg: Message, text: str):
+    try:
+        await msg.edit_text(text)
+    except Exception:
+        pass
 
 
 # ============================================================
-#                     ЗАПУСК WEB-СЕРВЕРА
+#                     ЗАПУСК
 # ============================================================
-async def on_startup(bot: Bot):
-    """Устанавливаем вебхук при старте."""
-    await bot.set_webhook(f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}", drop_pending_updates=True)
-    print(f"✅ Вебхук установлен на {BASE_WEBHOOK_URL}{WEBHOOK_PATH}")
-    # Запускаем таймер бездействия при старте
-    update_activity()
-    start_shutdown_timer()
-
-
-async def on_shutdown(bot: Bot):
-    """Удаляем вебхук при выключении."""
-    await bot.delete_webhook()
-    print("👋 Вебхук удалён. Бот выключен.")
-
-
-def main():
-    """Точка входа."""
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-
-    app = web.Application()
-
-    # Создаём обработчик вебхуков
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-        secret_token=os.environ.get("WEBHOOK_SECRET", "my-secret")
-    )
-
-    # Регистрируем маршрут для вебхука
-    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
-
-    # Настраиваем aiohttp приложение
-    setup_application(app, dp, bot=bot)
-
-    # Запускаем сервер
-    print(f"🚀 Запуск сервера на {WEBHOOK_HOST}:{WEBHOOK_PORT}")
-    web.run_app(app, host=WEBHOOK_HOST, port=WEBHOOK_PORT)
+async def main():
+    print("🚀 Бот успешно подключен к Telegram и слушает команды...")
+    await dp.start_polling(bot)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("\nБот остановлен.")
