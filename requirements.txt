@@ -1,5 +1,7 @@
 aiogram>=3.7.0
 aiohttp>=3.9.0
-yt-dlp
+yt-dlp>=2026.1.15
+bgutil-ytdlp-pot-provider
 static-ffmpeg
 pillow
+curl-cffi
