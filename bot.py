@@ -16,6 +16,7 @@ from aiogram.types import (
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
     InlineKeyboardMarkup, InlineKeyboardButton,
     BufferedInputFile, InputSticker, BotCommand,
+    MenuButtonCommands,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -87,7 +88,6 @@ FUNNY_REPLIES = [
 TTS_VOICES = {
     "ru_m1": ("ru-RU-DmitryNeural", "🇷🇺 Дмитрий (муж)"),
     "ru_f1": ("ru-RU-SvetlanaNeural", "🇷🇺 Светлана (жен)"),
-    "ru_f2": ("ru-RU-DariyaNeural", "🇷🇺 Дарья (жен)"),
     "en_m1": ("en-US-GuyNeural", "🇺🇸 Guy (male)"),
     "en_f1": ("en-US-AriaNeural", "🇺🇸 Aria (female)"),
 }
@@ -487,7 +487,7 @@ def owner_reply_kb():
 
 
 async def run_tts(text: str, voice: str, out_path: str):
-    communicate = edge_tts.Communicate(text, voice)
+    communicate = edge_tts.Communicate(text, voice, rate="+0%", volume="+0%")
     await communicate.save(out_path)
     return out_path
 
@@ -550,6 +550,14 @@ async def cmd_start(message: Message):
         "🎙 Озвучка — текст превращаю в голос\n"
         "🎨 Стикерпаки — собираю твои стикеры\n"
         f"🤫 Шёпот — в чате напиши `@{bot_uname} текст @username`\n\n"
+        "📖 Команды:\n"
+        "/help — помощь\n"
+        "/tts — озвучка текста\n"
+        "/stickers — стикерпаки\n"
+        "/whisper — как отправить шёпот\n"
+        "/mykey — мой ключ\n"
+        "/code — активировать ключ\n"
+        "/cancel — отменить действие\n\n"
         "🔑 Отправь /code ТВОЙ_КЛЮЧ, чтобы начать."
     )
     if is_owner(message.from_user):
@@ -569,7 +577,8 @@ async def cmd_help(message: Message):
         "📖 *Что умею:*\n\n"
         "🎙 `/tts` — озвучить текст\n"
         "🎨 `/stickers` — стикерпаки\n"
-        "🤫 `/whisper` — как отправить шёпот\n\n"
+        "🤫 `/whisper` — как отправить шёпот\n"
+        "🔑 `/mykey` — статус ключа\n\n"
         "📷 *Фото* — режу на 3×N\n"
         "🎬 *TikTok-ссылка* — видео или MP3\n"
         "🎵 *Аудиофайл* — обложка и теги\n\n"
@@ -1527,7 +1536,6 @@ async def keep_alive():
 
 
 async def set_bot_commands():
-    """Устанавливает меню команд в Telegram."""
     commands = [
         BotCommand(command="start", description="Начать работу"),
         BotCommand(command="help", description="Помощь"),
@@ -1545,12 +1553,34 @@ async def set_bot_commands():
         print(f"set_my_commands err: {e}")
 
 
+async def set_bot_menu():
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        print("Меню-кнопка установлена")
+    except Exception as e:
+        print(f"set_chat_menu_button err: {e}")
+
+
+async def test_tts():
+    try:
+        test_path = "downloads/test_tts.mp3"
+        await run_tts("тест", "ru-RU-DmitryNeural", test_path)
+        size = os.path.getsize(test_path) if os.path.exists(test_path) else 0
+        print(f"TTS test: {size} bytes")
+        if os.path.exists(test_path):
+            os.remove(test_path)
+    except Exception as e:
+        print(f"TTS test failed: {e}")
+
+
 dp.message.middleware(AccessMiddleware())
 
 
 async def main():
     print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}")
     await set_bot_commands()
+    await set_bot_menu()
+    await test_tts()
     print("Bot started")
     asyncio.create_task(keep_alive())
     await dp.start_polling(bot)
