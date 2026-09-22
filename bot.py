@@ -522,24 +522,49 @@ def other_site_download(url, mode):
 
 
 def split_image(image_path, total_parts):
-    img = Image.open(image_path)
+    img = Image.open(image_path).convert("RGB")
     w, h = img.size
     cols = 3
     rows = total_parts // cols
+    
+    # 1. Центральный кроп до пропорций 3:4 (чтобы каждый кусочек был ровным квадратом)
+    target_ar = cols / rows
+    current_ar = w / h
+    
+    if current_ar > target_ar:
+        new_w = int(h * target_ar)
+        left = (w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, h))
+    else:
+        new_h = int(w / target_ar)
+        top = (h - new_h) // 2
+        img = img.crop((0, top, w, top + new_h))
+        
+    w, h = img.size
     pw = w // cols
     ph = h // rows
+    
+    # 2. Масштабируем, чтобы все кусочки были абсолютно одинаковыми по пикселям
+    new_w = pw * cols
+    new_h = ph * rows
+    if (new_w, new_h) != (w, h):
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        
     files = []
     for row in range(rows):
         for col in range(cols):
             left = col * pw
             top = row * ph
-            right = (col + 1) * pw if col < cols - 1 else w
-            bottom = (row + 1) * ph if row < rows - 1 else h
+            right = left + pw
+            bottom = top + ph
+            
             crop = img.crop((left, top, right, bottom))
-            fn = f"temp_photos/part_{row}_{col}.jpg"
-            # Максимальное качество без субдискретизации — чтобы на стыках не было "плитки"
-            crop.save(fn, "JPEG", quality=100, subsampling=0)
+            fn = f"temp_photos/part_{row}_{col}.png"
+            
+            # Сохраняем в PNG (без потери качества)
+            crop.save(fn, "PNG")
             files.append(fn)
+            
     return files
 
 
@@ -1500,7 +1525,7 @@ async def execute_splitting(msg_obj, state, pp, n):
                 continue
             idx = i + 1
             await msg_obj.answer_document(
-                FSInputFile(pf, filename=f"{idx:02d}.jpg"),
+                FSInputFile(pf, filename=f"{idx:02d}.png"),
                 caption=f"{idx}/{total}",
             )
             await asyncio.sleep(0.4)
