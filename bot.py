@@ -1,9 +1,12 @@
 import os
 import re
+import io
 import json
 import time
 import asyncio
 import secrets
+import random
+import itertools
 import urllib.request
 import urllib.parse
 import subprocess
@@ -11,6 +14,9 @@ from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import (
     Message, FSInputFile, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
+    InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BufferedInputFile, InputSticker,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -19,6 +25,7 @@ from aiogram.fsm.state import StatesGroup, State
 from PIL import Image
 import yt_dlp
 from static_ffmpeg import run as static_ffmpeg_run
+import edge_tts
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -38,6 +45,8 @@ KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
+BOT_USERNAME_CACHE = None
+
 
 class BotStates(StatesGroup):
     waiting_for_parts = State()
@@ -45,10 +54,47 @@ class BotStates(StatesGroup):
     waiting_for_cover = State()
     waiting_for_meta = State()
     waiting_for_duration = State()
+    # TTS
+    waiting_tts_text = State()
+    # Stickers
+    waiting_sticker_name = State()
+    waiting_sticker_title = State()
+    waiting_sticker_first = State()
+    waiting_sticker_emoji = State()
+    waiting_sticker_add_photo = State()
 
 
 os.makedirs("downloads", exist_ok=True)
 os.makedirs("temp_photos", exist_ok=True)
+
+WHISPERS = {}
+_whisper_counter = itertools.count(1)
+
+FUNNY_REPLIES = [
+    "Ержан, фу, нельзя, место!",
+    "Дорогая, не лезь, оно тебя сожрёт",
+    "Тебя в детстве не учили не нажимать куда попало?",
+    "Это не твоё. Отойди.",
+    "Руки убрал!",
+    "Не для тебя писали.",
+    "Читать чужие шёпоты — плохая примета.",
+    "Здесь пусто. Серьёзно. Уходи.",
+    "Кыш.",
+    "А тебе кто разрешил?",
+    "Тут был шёпот. Был. Ключевое слово — был.",
+    "Не суй нос в чужой шёпот.",
+    "Любопытной Варваре на базаре нос оторвали.",
+    "Иди своей дорогой, путник.",
+]
+
+
+TTS_VOICES = {
+    "ru_m1": ("ru-RU-DmitryNeural", "🇷🇺 Дмитрий (муж)"),
+    "ru_f1": ("ru-RU-SvetlanaNeural", "🇷🇺 Светлана (жен)"),
+    "ru_f2": ("ru-RU-DariyaNeural", "🇷🇺 Дарья (жен)"),
+    "en_m1": ("en-US-GuyNeural", "🇺🇸 Guy (male)"),
+    "en_f1": ("en-US-AriaNeural", "🇺🇸 Aria (female)"),
+}
 
 
 def load_data():
@@ -58,10 +104,12 @@ def load_data():
                 d = json.load(f)
                 d.setdefault("keys", {})
                 d.setdefault("users", {})
+                d.setdefault("sticker_packs", {})
+                d.setdefault("tts_usage", {})
                 return d
         except Exception as e:
             print(f"load_data: {e}")
-    return {"keys": {}, "users": {}}
+    return {"keys": {}, "users": {}, "sticker_packs": {}, "tts_usage": {}}
 
 
 def save_data(data):
@@ -83,6 +131,14 @@ def is_owner(user) -> bool:
     if OWNER_ID is not None and user.id == OWNER_ID:
         return True
     return (user.username or "").lower() == OWNER_USERNAME
+
+
+async def get_bot_username() -> str:
+    global BOT_USERNAME_CACHE
+    if BOT_USERNAME_CACHE is None:
+        me = await bot.get_me()
+        BOT_USERNAME_CACHE = me.username
+    return BOT_USERNAME_CACHE
 
 
 def generate_key():
@@ -144,7 +200,10 @@ def user_status(user_id):
     return "expired"
 
 
-PASSTHROUGH_COMMANDS = {"/whoami", "/cancel", "/start", "/mykey", "/help", "/code"}
+PASSTHROUGH_COMMANDS = {
+    "/whoami", "/cancel", "/start", "/mykey", "/help", "/code",
+    "/tts", "/stickers", "/whisper",
+}
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -323,8 +382,6 @@ def tiktok_via_api(url, mode):
 
 
 def other_site_download(url, mode):
-    """Скачивание через yt-dlp для всего, кроме TikTok.
-    YouTube с серверов RelaxDev не работает — IP в бане."""
     opts = {
         "outtmpl": "downloads/%(id)s.%(ext)s",
         "quiet": True,
@@ -434,8 +491,56 @@ def owner_reply_kb():
     )
 
 
+def user_reply_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎙 Озвучить текст"),
+             KeyboardButton(text="🎨 Стикерпаки")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 # ============================================================
-#                         ХЕНДЛЕРЫ
+#                       TTS
+# ============================================================
+
+async def run_tts(text: str, voice: str, out_path: str):
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(out_path)
+    return out_path
+
+
+def tts_voice_kb():
+    b = InlineKeyboardBuilder()
+    for key, (_, label) in TTS_VOICES.items():
+        b.button(text=label, callback_data=f"tts_voice:{key}")
+    b.adjust(2)
+    return b.as_markup()
+
+
+# ============================================================
+#                     STICKER HELPERS
+# ============================================================
+
+def photo_to_webp_sticker(src_path: str, dst_path: str):
+    img = Image.open(src_path).convert("RGBA")
+    w, h = img.size
+    side = max(w, h)
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+    canvas = canvas.resize((512, 512), Image.LANCZOS)
+    canvas.save(dst_path, "WEBP", quality=95, method=6)
+    return dst_path
+
+
+def validate_pack_shortname(name: str) -> bool:
+    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9_]{0,50}$", name))
+
+
+# ============================================================
+#                         HANDLERS
 # ============================================================
 
 @dp.message(F.text == "/whoami")
@@ -450,13 +555,15 @@ async def cmd_whoami(message: Message):
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
+    bot_uname = await get_bot_username()
     text = (
         "👋 Привет! Что я умею:\n\n"
         "📷 Фото — режу на части 3×N\n"
         "🎬 TikTok — качаю видео или вытаскиваю звук\n"
         "🎵 Аудио — ставлю обложку, название, исполнителя\n"
-        "🔗 Другие ссылки (VK, Rutube и т.п.) — попробую скачать\n\n"
-        "⚠️ YouTube не поддерживаю — с сервера он не качается.\n\n"
+        "🎙 Озвучка — текст превращаю в аудио\n"
+        "🎨 Стикерпаки — собираю твои стикеры\n"
+        "🤫 Шёпот — в чате напиши `@" + bot_uname + " текст @username`\n\n"
         "🔑 Отправь /code ТВОЙ_КЛЮЧ, чтобы начать."
     )
     if is_owner(message.from_user):
@@ -467,6 +574,19 @@ async def cmd_start(message: Message):
         )
     else:
         await message.answer(text, parse_mode=None)
+
+
+@dp.message(F.text == "/help")
+async def cmd_help(message: Message):
+    bot_uname = await get_bot_username()
+    await message.answer(
+        "📖 *Команды:*\n\n"
+        "/tts — озвучить текст\n"
+        "/stickers — стикерпаки\n"
+        f"/whisper — как работает шёпот\n\n"
+        f"🤫 *Шёпот в чате:* `@{bot_uname} текст @username`",
+        parse_mode="Markdown",
+    )
 
 
 @dp.message(F.text.startswith("/code"))
@@ -500,6 +620,8 @@ async def cmd_mykey(message: Message):
             f"⏳ Осталось: {format_duration(rem)}"
         )
 
+
+# --- ADMIN ---
 
 @dp.message(F.text == "/newkey")
 async def cmd_newkey(message: Message):
@@ -626,7 +748,506 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 
 # ============================================================
-#                      РАБОТА С МЕДИА
+#                         TTS
+# ============================================================
+
+@dp.message(F.text == "/tts")
+@dp.message(F.text == "🎙 Озвучить текст")
+async def cmd_tts(message: Message, state: FSMContext):
+    await state.set_state(None)
+    await message.answer(
+        "🎙 Выбери голос:",
+        reply_markup=tts_voice_kb(),
+    )
+
+
+@dp.callback_query(F.data.startswith("tts_voice:"))
+async def cb_tts_voice(cb: CallbackQuery, state: FSMContext):
+    voice_key = cb.data.split(":", 1)[1]
+    if voice_key not in TTS_VOICES:
+        await cb.answer("Такого голоса нет.", show_alert=True)
+        return
+    await state.update_data(tts_voice=voice_key)
+    await state.set_state(BotStates.waiting_tts_text)
+    await cb.message.edit_text(
+        f"🎙 Голос: {TTS_VOICES[voice_key][1]}\n\n"
+        f"Пришли текст — озвучу. До 1000 символов."
+    )
+    await cb.answer()
+
+
+@dp.message(BotStates.waiting_tts_text)
+async def process_tts_text(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("⚠️ Пустой текст.")
+        return
+    if len(text) > 1000:
+        await message.answer(f"⚠️ Слишком много: {len(text)} символов. Максимум 1000.")
+        return
+    data = await state.get_data()
+    voice_key = data.get("tts_voice", "ru_f1")
+    voice_id, voice_label = TTS_VOICES[voice_key]
+
+    status = await message.answer("🎙 Генерирую...")
+    out = f"downloads/tts_{message.from_user.id}_{int(time.time())}.mp3"
+    try:
+        await run_tts(text, voice_id, out)
+        if not os.path.exists(out) or os.path.getsize(out) < 100:
+            raise RuntimeError("пустой файл")
+        dur = await asyncio.get_event_loop().run_in_executor(None, get_duration, out)
+        kw = {
+            "audio": FSInputFile(out, filename="voice.mp3"),
+            "caption": f"🎙 Голос: {voice_label}",
+        }
+        if dur:
+            kw["duration"] = int(dur)
+        await message.answer_voice(**kw)
+        await status.delete()
+    except Exception as e:
+        err = str(e)[:300]
+        try:
+            await status.edit_text(f"😔 Не получилось озвучить:\n{err}")
+        except Exception:
+            await message.answer(f"😔 Не получилось озвучить:\n{err}")
+    finally:
+        if os.path.exists(out):
+            try:
+                os.remove(out)
+            except Exception:
+                pass
+        await state.clear()
+
+
+# ============================================================
+#                    ШЁПОТ (INLINE MODE)
+# ============================================================
+
+@dp.message(F.text == "/whisper")
+async def cmd_whisper(message: Message):
+    bot_uname = await get_bot_username()
+    await message.answer(
+        "🤫 *Как отправить шёпот:*\n\n"
+        f"1. Напиши в любом чате: `@{bot_uname} текст @username`\n"
+        f"2. Сверху появится подсказка — выбери её\n"
+        f"3. Отправь — прочитает только адресат\n\n"
+        f"Например: `@{bot_uname} привет, ты классный @vimbrix`",
+        parse_mode="Markdown",
+    )
+
+
+@dp.inline_query()
+async def inline_whisper(query: InlineQuery):
+    text = (query.query or "").strip()
+    bot_uname = (await get_bot_username()).lower()
+
+    if not text:
+        result = InlineQueryResultArticle(
+            id="hint_empty",
+            title="🤫 Напиши: текст @username",
+            description="Например: привет @vimbrix",
+            input_message_content=InputTextMessageContent(
+                message_text=(
+                    "🤫 *Как отправить шёпот:*\n\n"
+                    f"1. Напиши в поле ввода: `@{bot_uname} текст @username`\n"
+                    "2. Выбери подсказку сверху\n"
+                    "3. Отправь — прочитает только получатель."
+                ),
+                parse_mode="Markdown",
+            ),
+        )
+        await query.answer([result], cache_time=0, is_personal=True)
+        return
+
+    mentions = [
+        m for m in re.finditer(r"@(\w+)", text)
+        if m.group(1).lower() != bot_uname
+    ]
+
+    if not mentions:
+        result = InlineQueryResultArticle(
+            id="hint_no_target",
+            title="🤫 Добавь @username получателя",
+            description="Например: привет @vimbrix",
+            input_message_content=InputTextMessageContent(
+                message_text=(
+                    "🤫 *Не хватает получателя.*\n\n"
+                    f"Напиши: `@{bot_uname} текст @username`"
+                ),
+                parse_mode="Markdown",
+            ),
+        )
+        await query.answer([result], cache_time=0, is_personal=True)
+        return
+
+    target_mention = mentions[-1]
+    target_username = target_mention.group(1)
+    whisper_text = text[:target_mention.start()].strip()
+
+    if not whisper_text:
+        result = InlineQueryResultArticle(
+            id="hint_no_text",
+            title="🤫 А что шептать-то?",
+            description="Напиши текст перед @username",
+            input_message_content=InputTextMessageContent(
+                message_text="🤫 Добавь текст перед @username."
+            ),
+        )
+        await query.answer([result], cache_time=0, is_personal=True)
+        return
+
+    target_id = None
+    for uid, udata in DATA["users"].items():
+        if (udata.get("username") or "").lower() == target_username.lower():
+            target_id = int(uid)
+            break
+
+    wid = next(_whisper_counter)
+    WHISPERS[wid] = {
+        "target_id": target_id,
+        "target_name": target_username,
+        "text": whisper_text,
+        "from_id": query.from_user.id,
+        "from_name": query.from_user.full_name,
+        "expires": time.time() + 86400,
+    }
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Прочитать содержимое", callback_data=f"whisper:{wid}")],
+        [InlineKeyboardButton(text="Как отправлять шепот?", callback_data="whisper_help")],
+    ])
+
+    result = InlineQueryResultArticle(
+        id=str(wid),
+        title=f"🤫 Шёпот для @{target_username}",
+        description=whisper_text[:60],
+        input_message_content=InputTextMessageContent(
+            message_text=(
+                f"🔒 Секретное сообщение для @{target_username}\n"
+                f"Только он может прочитать содержимое"
+            ),
+        ),
+        reply_markup=kb,
+    )
+    await query.answer([result], cache_time=0, is_personal=True)
+
+
+@dp.callback_query(F.data.startswith("whisper:"))
+async def cb_whisper(cb: CallbackQuery):
+    try:
+        wid = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Шёпот сломался.", show_alert=True)
+        return
+
+    w = WHISPERS.get(wid)
+    if not w:
+        await cb.answer("Этот шёпот уже улетел в никуда.", show_alert=True)
+        return
+    if w["expires"] < time.time():
+        WHISPERS.pop(wid, None)
+        await cb.answer("Шёпот устарел и растворился.", show_alert=True)
+        return
+
+    is_target = False
+    if w["target_id"] is not None and cb.from_user.id == w["target_id"]:
+        is_target = True
+    if (cb.from_user.username or "").lower() == w["target_name"].lower():
+        is_target = True
+
+    if is_target:
+        txt = w["text"]
+        if len(txt) <= 180:
+            await cb.answer(f"🤫 {txt}", show_alert=True)
+        else:
+            try:
+                await bot.send_message(
+                    cb.from_user.id,
+                    f"🤫 Шёпот от {w['from_name']}:\n\n{txt}",
+                )
+                await cb.answer("📩 Шёпот ушёл тебе в личку.", show_alert=True)
+            except Exception:
+                await cb.answer(f"🤫 {txt[:180]}...", show_alert=True)
+    else:
+        await cb.answer(random.choice(FUNNY_REPLIES), show_alert=True)
+
+
+@dp.callback_query(F.data == "whisper_help")
+async def cb_whisper_help(cb: CallbackQuery):
+    bot_uname = await get_bot_username()
+    await cb.answer(
+        "🤫 Чтобы отправить шёпот:\n\n"
+        f"1. В любом чате напиши:\n@{bot_uname} текст @username\n\n"
+        "2. Выбери подсказку сверху\n"
+        "3. Отправь — прочитает только адресат",
+        show_alert=True,
+    )
+
+
+# ============================================================
+#                       СТИКЕРПАКИ
+# ============================================================
+
+@dp.message(F.text == "/stickers")
+@dp.message(F.text == "🎨 Стикерпаки")
+async def cmd_stickers(message: Message, state: FSMContext):
+    await state.set_state(None)
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Создать новый", callback_data="st_create")
+    b.button(text="📎 Добавить в существующий", callback_data="st_add")
+    b.button(text="📂 Мои паки", callback_data="st_list")
+    b.adjust(1)
+    await message.answer(
+        "🎨 Стикерпаки.\n\n"
+        "Создай свой пак — и добавляй туда стикеры из фото.\n"
+        "В описании пака будет метка «создано этим ботом».",
+        reply_markup=b.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "st_create")
+async def cb_st_create(cb: CallbackQuery, state: FSMContext):
+    bot_uname = await get_bot_username()
+    await cb.message.edit_text(
+        "📝 Придумай короткое имя для пака (латиница, цифры, `_`).\n"
+        f"В Telegram он будет выглядеть как `имя_by_{bot_uname}`.\n\n"
+        "Пример: `mycats`"
+    )
+    await state.set_state(BotStates.waiting_sticker_name)
+    await cb.answer()
+
+
+@dp.message(BotStates.waiting_sticker_name)
+async def process_sticker_name(message: Message, state: FSMContext):
+    short = (message.text or "").strip().lower()
+    if not validate_pack_shortname(short):
+        await message.answer(
+            "⚠️ Не подходит. Только латиница, цифры, `_`. Начинается с буквы."
+        )
+        return
+    bot_uname = await get_bot_username()
+    full_name = f"{short}_by_{bot_uname}"
+    if len(full_name) > 64:
+        await message.answer("⚠️ Слишком длинное. Сократи.")
+        return
+    await state.update_data(sticker_short=short, sticker_full=full_name)
+    await state.set_state(BotStates.waiting_sticker_title)
+    await message.answer(
+        f"📛 Теперь название пака (то, что видно в списке).\n"
+        f"Пример: `Мои котики`"
+    )
+
+
+@dp.message(BotStates.waiting_sticker_title)
+async def process_sticker_title(message: Message, state: FSMContext):
+    title = (message.text or "").strip()
+    if not title or len(title) > 64:
+        await message.answer("⚠️ Название 1-64 символа. Попробуй ещё.")
+        return
+    await state.update_data(sticker_title=title)
+    await state.set_state(BotStates.waiting_sticker_first)
+    await message.answer(
+        "🖼 Теперь пришли первую картинку для стикера.\n"
+        "Из неё сделаю стикер 512×512."
+    )
+
+
+@dp.message(BotStates.waiting_sticker_first, F.photo)
+async def process_sticker_first(message: Message, state: FSMContext):
+    data = await state.get_data()
+    full_name = data.get("sticker_full")
+    title = data.get("sticker_title")
+    if not full_name or not title:
+        await message.answer("⚠️ Что-то потерялось. Начни заново: /stickers")
+        await state.clear()
+        return
+
+    p = message.photo[-1]
+    fi = await bot.get_file(p.file_id)
+    src = f"temp_photos/{p.file_id}.jpg"
+    dst = f"temp_photos/sticker_{p.file_id}.webp"
+    await bot.download_file(fi.file_path, src)
+
+    status = await message.answer("🎨 Готовлю стикер...")
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, photo_to_webp_sticker, src, dst)
+        if not os.path.exists(dst):
+            raise RuntimeError("не удалось создать webp")
+        with open(dst, "rb") as f:
+            sticker_bytes = f.read()
+        if len(sticker_bytes) > 512 * 1024:
+            raise RuntimeError("стикер больше 512 КБ")
+
+        try:
+            await bot.create_new_sticker_set(
+                user_id=message.from_user.id,
+                name=full_name,
+                title=title,
+                stickers=[InputSticker(
+                    sticker=BufferedInputFile(sticker_bytes, filename="sticker.webp"),
+                    format="static",
+                    emoji_list=["😀"],
+                )],
+            )
+        except Exception as e:
+            err = str(e)
+            if "PeerIdInvalid" in err or "user not found" in err.lower():
+                await status.edit_text(
+                    "⚠️ Telegram не даёт создать пак.\n\n"
+                    "Напиши боту в личку /start (уже сделано?) и попробуй снова.\n"
+                    "Также проверь — может, имя пака занято."
+                )
+                await state.clear()
+                return
+            raise
+
+        user_id = str(message.from_user.id)
+        packs = DATA["sticker_packs"].setdefault(user_id, [])
+        packs.append({
+            "name": full_name,
+            "title": title,
+            "created_at": time.time(),
+        })
+        save_data(DATA)
+
+        await status.edit_text(
+            f"✅ Пак создан!\n\n"
+            f"📛 {title}\n"
+            f"🔗 https://t.me/addstickers/{full_name}\n\n"
+            f"Теперь можешь кидать фото сюда и добавлять их в этот пак."
+        )
+    except Exception as e:
+        err = str(e)[:300]
+        try:
+            await status.edit_text(f"❌ Ошибка:\n{err}")
+        except Exception:
+            await message.answer(f"❌ Ошибка:\n{err}")
+    finally:
+        for f in (src, dst):
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        await state.clear()
+
+
+@dp.message(BotStates.waiting_sticker_first)
+async def wrong_sticker_first(message: Message):
+    await message.answer("🖼 Нужна именно картинка.")
+
+
+@dp.callback_query(F.data == "st_list")
+async def cb_st_list(cb: CallbackQuery):
+    user_id = str(cb.from_user.id)
+    packs = DATA["sticker_packs"].get(user_id, [])
+    if not packs:
+        await cb.message.edit_text("📂 У тебя пока нет паков. Создай первый через /stickers")
+        await cb.answer()
+        return
+    lines = ["📂 Твои стикерпаки:\n"]
+    for p in packs:
+        lines.append(f"• {p['title']}\n  https://t.me/addstickers/{p['name']}")
+    await cb.message.edit_text("\n".join(lines))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "st_add")
+async def cb_st_add(cb: CallbackQuery, state: FSMContext):
+    user_id = str(cb.from_user.id)
+    packs = DATA["sticker_packs"].get(user_id, [])
+    if not packs:
+        await cb.message.edit_text("📂 У тебя ещё нет паков. Создай сначала: /stickers")
+        await cb.answer()
+        return
+    b = InlineKeyboardBuilder()
+    for i, p in enumerate(packs):
+        b.button(text=p["title"], callback_data=f"st_pick:{i}")
+    b.adjust(1)
+    await cb.message.edit_text("📎 В какой пак добавить?", reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("st_pick:"))
+async def cb_st_pick(cb: CallbackQuery, state: FSMContext):
+    try:
+        idx = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Ошибка", show_alert=True)
+        return
+    user_id = str(cb.from_user.id)
+    packs = DATA["sticker_packs"].get(user_id, [])
+    if idx < 0 or idx >= len(packs):
+        await cb.answer("Пак не найден", show_alert=True)
+        return
+    pack = packs[idx]
+    await state.update_data(add_pack=pack["name"])
+    await state.set_state(BotStates.waiting_sticker_add_photo)
+    await cb.message.edit_text(
+        f"📎 Пак: {pack['title']}\n\n"
+        f"Пришли картинку для стикера."
+    )
+    await cb.answer()
+
+
+@dp.message(BotStates.waiting_sticker_add_photo, F.photo)
+async def process_sticker_add(message: Message, state: FSMContext):
+    data = await state.get_data()
+    pack_name = data.get("add_pack")
+    if not pack_name:
+        await message.answer("⚠️ Что-то потерялось. Заново: /stickers")
+        await state.clear()
+        return
+
+    p = message.photo[-1]
+    fi = await bot.get_file(p.file_id)
+    src = f"temp_photos/{p.file_id}.jpg"
+    dst = f"temp_photos/sticker_{p.file_id}.webp"
+    await bot.download_file(fi.file_path, src)
+
+    status = await message.answer("🎨 Готовлю стикер...")
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, photo_to_webp_sticker, src, dst)
+        with open(dst, "rb") as f:
+            sticker_bytes = f.read()
+        if len(sticker_bytes) > 512 * 1024:
+            raise RuntimeError("стикер больше 512 КБ")
+
+        await bot.add_sticker_to_set(
+            user_id=message.from_user.id,
+            name=pack_name,
+            sticker=InputSticker(
+                sticker=BufferedInputFile(sticker_bytes, filename="sticker.webp"),
+                format="static",
+                emoji_list=["😀"],
+            ),
+        )
+        await status.edit_text(f"✅ Стикер добавлен в {pack_name}")
+    except Exception as e:
+        err = str(e)[:300]
+        try:
+            await status.edit_text(f"❌ Ошибка:\n{err}")
+        except Exception:
+            await message.answer(f"❌ Ошибка:\n{err}")
+    finally:
+        for f in (src, dst):
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        await state.clear()
+
+
+@dp.message(BotStates.waiting_sticker_add_photo)
+async def wrong_sticker_add(message: Message):
+    await message.answer("🖼 Нужна именно картинка.")
+
+
+# ============================================================
+#                    РАБОТА С МЕДИА
 # ============================================================
 
 @dp.message(F.audio)
