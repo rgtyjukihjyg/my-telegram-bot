@@ -25,7 +25,14 @@ if not BOT_TOKEN:
     raise ValueError("❌ Не задана переменная BOT_TOKEN")
 
 OWNER_USERNAME = (os.environ.get("OWNER_USERNAME") or "vimbrix").lower().lstrip("@")
+OWNER_ID_RAW = os.environ.get("OWNER_ID") or ""
+try:
+    OWNER_ID = int(OWNER_ID_RAW) if OWNER_ID_RAW.strip() else None
+except ValueError:
+    OWNER_ID = None
+
 DATA_FILE = "data.json"
+COOKIES_FILE = "cookies.txt"
 KEY_LENGTH = 12
 KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -36,8 +43,9 @@ class BotStates(StatesGroup):
     waiting_for_parts = State()
     waiting_for_media_type = State()
     waiting_for_cover = State()
-    waiting_for_meta = State()
+    waiting_for_metaasci = State()
     waiting_for_duration = State()
+    waiting_for_cookies = State()
 
 os.makedirs("downloads", exist_ok=True)
 os.makedirs("temp_photos", exist_ok=True)
@@ -61,12 +69,54 @@ def save_data(data):
     try:
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_i=False, indent=2)
         os.replace(tmp, DATA_FILE)
     except Exception as e:
         print(f"⚠ save_data: {e}")
 
 DATA = load_data()
+
+def is_owner(user) -> bool:
+    if not user:
+        return False
+    if OWNER_ID is not None and user.id == OWNER_ID:
+        return True
+    return (user.username or "").lower() == OWNER_USERNAME
+
+# ============================================================
+#   COOKIES
+# ============================================================
+def normalize_cookies(text: str) -> str:
+    """Приводит текст cookies к формату Netscape (табы между полями)."""
+    out_lines = []
+    for raw in text.splitlines():
+        line = raw.rstrip("\r\n")
+        if not line.strip():
+            continue
+        if line.startswith("#HttpOnly_"):
+            rest = line[len("#HttpOnly_"):]
+            parts = re.split(r"[ \t]+", rest, maxsplit=6)
+            if len(parts) == 7:
+                out_lines.append("#HttpOnly_" + "\t".join(parts))
+            else:
+                out_lines.append(line)
+        elif line.startswith("#"):
+            out_lines.append(line)
+        else:
+            parts = re.split(r"[ \t]+", line, maxsplit=6)
+            if len(parts) == 7:
+                out_lines.append("\t".join(parts))
+            else:
+                out_lines.append(line)
+    return "\n".join(out_lines) + "\n"
+
+def reload_cookies():
+    """Возвращает путь к cookies.txt или None."""
+    global COOKIES_PATH
+    COOKIES_PATH = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+    return COOKIES_PATH
+
+COOKIES_PATH = reload_cookies()
 
 # ============================================================
 #   КЛЮЧИ
@@ -116,6 +166,8 @@ def user_status(user_id) -> str:
 # ============================================================
 #   MIDDLEWARE
 # ============================================================
+PASSTHROUGH_COMMANDS = {"/whoami", "/setcookies", "/delcookies", "/cancel"}
+
 class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if not isinstance(event, Message):
@@ -123,21 +175,32 @@ class AccessMiddleware(BaseMiddleware):
         user = event.from_user
         if user is None:
             return await handler(event, data)
-        if (user.username or "").lower() == OWNER_USERNAME:
+
+        text = (getattr(event, "text", None) or "").strip()
+        cmd = text.split()[0].lower() if text else ""
+
+        # Всегда пропускаем эти команды — они сами проверят владельца
+        if cmd in PASSTHROUGH_COMMANDS:
             return await handler(event, data)
+
+        # Владелец — проходит всегда
+        if is_owner(user):
+            return await handler(event, data)
+
         status = user_status(user.id)
         if status == "valid":
             return await handler(event, data)
         if status == "expired":
             DATA["users"].pop(str(user.id), None)
             save_data(DATA)
-            await event.answer("⏳ *Срок действия вашего ключа истёк.*\n\nВведите новый ключ доступа.")
+            await event.answer("⏳ *Срок действия ключа истёк.*\n\nВведите новый ключ доступа.")
             return
-        text = (getattr(event, "text", None) or "").strip().upper()
+
         if text and len(text) == KEY_LENGTH and text.isalnum() and text.isupper():
             await try_activate_key(event, user, text)
             return
-        await event.answer("🔒 *Доступ только по ключу.*\n\nОтправьте ваш ключ доступа одним сообщением.")
+
+        await event.answer("🔒 *Доступ только по ключу.*\n\nОтправьте ваш ключ одним сообщением.")
 
 async def try_activate_key(event: Message, user, key: str):
     key_data = DATA["keys"].get(key)
@@ -150,9 +213,9 @@ async def try_activate_key(event: Message, user, key: str):
         if str(used_by) == user_id:
             u = DATA["users"].get(user_id, {})
             if u.get("permanent"):
-                await event.answer("✅ Вы уже активировали этот ключ (♾ перманентный).")
+                await event.answer("✅ Вы уже активировали этот ключ (♾).")
             else:
-                await event.answer(f"✅ Вы уже активировали этот ключ.\n⏳ До: *{format_until(u.get('expires_at', 0))}*")
+                await event.answer(f"✅ Уже активирован.\n⏳ До: *{format_until(u.get('expires_at', 0))}*")
         else:
             await event.answer("❌ Этот ключ уже использован другим аккаунтом.")
         return
@@ -161,23 +224,22 @@ async def try_activate_key(event: Message, user, key: str):
     duration = int(key_data.get("duration", 0))
     key_data["used_by"] = user.id
     key_data["activated_at"] = now
-    entry = {"username": user.username or "", "key": key, "permanent": permanent, "activated_at": now}
+    entry = {"username": user.username or "", "key": key,
+             "permanent": permanent, "activated_at": now}
     if not permanent:
         entry["expires_at"] = now + duration
     DATA["users"][user_id] = entry
     save_data(DATA)
     if permanent:
-        await event.answer("✅ *Ключ активирован!*\n\nТип: ♾ *Перманентный*\n\nОтправьте /start")
+        await event.answer("✅ *Ключ активирован!* ♾ Перманентный.\n\nОтправьте /start")
     else:
         await event.answer(
-            f"✅ *Ключ активирован!*\n\n"
-            f"⏱ Длительность: *{format_duration(duration)}*\n"
-            f"⏳ До: *{format_until(now + duration)}*\n\n"
-            f"Отправьте /start"
+            f"✅ *Ключ активирован!*\n\n⏱ *{format_duration(duration)}*\n"
+            f"⏳ До: *{format_until(now + duration)}*\n\nОтправьте /start"
         )
 
 # ============================================================
-#   ЧИСТКА + FFMPEG + COOKIES
+#   ЧИСТКА + FFMPEG
 # ============================================================
 def _cleanup_folder(folder):
     if os.path.exists(folder):
@@ -196,11 +258,12 @@ FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_exec
 FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
 print(f"✅ ffmpeg: {FFMPEG_EXE_PATH}")
 
-COOKIES_PATH = "cookies.txt" if os.path.exists("cookies.txt") else None
 if COOKIES_PATH:
-    print("🍪 Найден cookies.txt — YouTube будет использовать его")
+    print(f"🍪 Найден {COOKIES_PATH}")
 else:
     print("ℹ cookies.txt не найден")
+
+print(f"👑 Owner: @{OWNER_USERNAME}" + (f" (id={OWNER_ID})" if OWNER_ID else ""))
 
 # ============================================================
 #   УТИЛИТЫ
@@ -248,26 +311,21 @@ def _download_direct(url, out_path, timeout=180):
 #   YOUTUBE
 # ============================================================
 def youtube_download(url, mode):
-    """Скачивает YouTube через yt-dlp с cookies (если есть)."""
-    print(f"🎬 YouTube, mode={mode}, cookies={'да' if COOKIES_PATH else 'нет'}")
+    cookies = reload_cookies()
+    print(f"🎬 YouTube mode={mode} cookies={cookies}")
     opts = {
         "outtmpl": "downloads/%(id)s.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "noplaylist": True,
-        "ffmpeg_location": FFMPEG_DIR,
+        "quiet": True, "no_warnings": True, "noprogress": True,
+        "noplaylist": True, "ffmpeg_location": FFMPEG_DIR,
     }
-    if COOKIES_PATH:
-        opts["cookiefile"] = COOKIES_PATH
+    if cookies:
+        opts["cookiefile"] = cookies
     if mode == "audio":
         opts.update({
             "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
+            "postprocessors": [{"key": "FFmpegExtractAudio",
+                                "preferredcodec": "mp3",
+                                "preferredquality": "192"}],
         })
     else:
         opts.update({
@@ -286,10 +344,8 @@ def youtube_download(url, mode):
     title = clean_meta(info.get("title") or "youtube")
     performer = clean_meta(
         info.get("artist") or info.get("uploader") or info.get("channel") or "",
-        max_len=64,
-    ) or "Unknown"
-    thumb_url = info.get("thumbnail")
-    return final, title, info.get("duration"), performer, thumb_url
+        max_len=64) or "Unknown"
+    return final, title, info.get("duration"), performer, info.get("thumbnail")
 
 # ============================================================
 #   TIKTOK
@@ -318,8 +374,7 @@ def tiktok_via_api(url, mode):
         r = subprocess.run(
             [FFMPEG_EXE_PATH, "-y", "-i", tmp, "-vn",
              "-c:a", "libmp3lame", "-b:a", "192k", out],
-            capture_output=True, text=True, encoding="utf-8", errors="ignore",
-        )
+            capture_output=True, text=True, encoding="utf-8", errors="ignore")
         try: os.remove(tmp)
         except Exception: pass
         if r.returncode != 0:
@@ -333,7 +388,7 @@ def tiktok_via_api(url, mode):
     return out, title, duration, None, None
 
 # ============================================================
-#   ФОТО
+#   ФОТО + АУДИО
 # ============================================================
 def split_image(image_path, total_parts):
     img = Image.open(image_path)
@@ -361,9 +416,6 @@ def calculate_auto_parts(image_path):
     rows = max(1, round(h / (w / 3)))
     return rows * 3
 
-# ============================================================
-#   АУДИО ТЕГИ
-# ============================================================
 def apply_tags(audio_path, cover_path, title, performer):
     out = os.path.splitext(audio_path)[0] + "_tagged.mp3"
     cmd = [FFMPEG_EXE_PATH, "-y", "-i", audio_path]
@@ -394,6 +446,70 @@ def get_duration(path):
 # ============================================================
 #   ХЕНДЛЕРЫ
 # ============================================================
+@dp.message(F.text == "/whoami")
+async def cmd_whoami(message: Message):
+    u = message.from_user
+    await message.answer(
+        f"🆔 *Твой Telegram ID:* `{u.id}`\n"
+        f"👤 *Username:* `@{u.username or 'нет'}`\n"
+        f"📛 *Имя:* {u.full_name}\n\n"
+        f"👑 *Ожидаемый владелец:* `@{OWNER_USERNAME}`\n"
+        f"🔑 *OWNER_ID в env:* `{OWNER_ID or 'не задан'}`\n\n"
+        f"*Ты владелец?* {'✅ ДА' if is_owner(u) else '❌ НЕТ'}"
+    )
+
+@dp.message(F.text == "/setcookies")
+async def cmd_setcookies(message: Message, state: FSMContext):
+    if not is_owner(message.from_user):
+        await message.answer("❌ Только владелец может это делать.")
+        return
+    await message.answer(
+        "🍪 Пришли следующим сообщением *содержимое* cookies.\n\n"
+        "Скопируй из Cookie-Editor (Export → Netscape) весь текст и вставь сюда.\n\n"
+        "Формат сохранится автоматически. /cancel — отмена."
+    )
+    await state.set_state(BotStates.waiting_for_cookies)
+
+@dp.message(BotStates.waiting_for_cookies)
+async def process_setcookies(message: Message, state: FSMContext):
+    if not is_owner(message.from_user):
+        await state.clear()
+        return
+    text = message.text or ""
+    if "youtube.com" not in text:
+        await message.answer("❌ Это не похоже на cookies YouTube. Попробуй ещё раз.")
+        return
+    normalized = normalize_cookies(text)
+    try:
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            f.write(normalized)
+        reload_cookies()
+        lines = [l for l in normalized.splitlines() if l and not l.startswith("#")]
+        await message.answer(
+            f"✅ *cookies.txt сохранён!*\n\n"
+            f"📊 Строк с cookies: *{len(lines)}*\n"
+            f"📁 Путь: `{COOKIES_FILE}`\n\n"
+            f"Можно пробовать YouTube."
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка записи: `{e}`")
+    await state.clear()
+
+@dp.message(F.text == "/delcookies")
+async def cmd_delcookies(message: Message):
+    if not is_owner(message.from_user):
+        await message.answer("❌ Только владелец.")
+        return
+    if os.path.exists(COOKIES_FILE):
+        try:
+            os.remove(COOKIES_FILE)
+            reload_cookies()
+            await message.answer("✅ cookies.txt удалён.")
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: `{e}`")
+    else:
+        await message.answer("ℹ Файла нет.")
+
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     await message.answer(
@@ -409,7 +525,7 @@ async def cmd_mykey(message: Message):
     user_id = str(message.from_user.id)
     u = DATA["users"].get(user_id)
     if not u:
-        await message.answer("ℹ У вас нет активного ключа.")
+        await message.answer("ℹ Нет активного ключа.")
         return
     if u.get("permanent"):
         await message.answer(f"♾ *Перманентный ключ*\n\n🔑 `{u.get('key')}`\n📅 {format_until(u.get('activated_at', 0))}")
@@ -424,13 +540,9 @@ async def cmd_mykey(message: Message):
             f"⏰ Осталось: *{format_duration(rem)}*"
         )
 
-def _is_owner(msg_or_cb) -> bool:
-    u = msg_or_cb.from_user
-    return (u.username or "").lower() == OWNER_USERNAME
-
 @dp.message(F.text == "/newkey")
 async def cmd_newkey(message: Message):
-    if not _is_owner(message): return
+    if not is_owner(message.from_user): return
     b = InlineKeyboardBuilder()
     b.button(text="♾ Перманентный", callback_data="newkey_perm")
     b.button(text="⏱ Временный", callback_data="newkey_temp")
@@ -438,11 +550,10 @@ async def cmd_newkey(message: Message):
 
 @dp.message(F.text == "/keys")
 async def cmd_keys(message: Message):
-    if not _is_owner(message): return
+    if not is_owner(message.from_user): return
     keys = DATA["keys"]
     if not keys:
-        await message.answer("ℹ Ключей нет.")
-        return
+        await message.answer("ℹ Ключей нет."); return
     lines = ["🔑 *Все ключи:*\n"]
     for k, kd in keys.items():
         if kd.get("used_by"):
@@ -450,8 +561,7 @@ async def cmd_keys(message: Message):
             uname = u.get("username") or "?"
             status = "♾ активен" if u.get("permanent") else (
                 f"⏳ до {format_until(u.get('expires_at', 0))}"
-                if u.get("expires_at", 0) > time.time() else "❌ истёк"
-            )
+                if u.get("expires_at", 0) > time.time() else "❌ истёк")
             lines.append(f"`{k}` → @{uname} ({status})")
         else:
             if kd.get("permanent"):
@@ -462,31 +572,30 @@ async def cmd_keys(message: Message):
 
 @dp.callback_query(F.data == "newkey_perm")
 async def cb_newkey_perm(cb: CallbackQuery):
-    if not _is_owner(cb):
+    if not is_owner(cb.from_user):
         await cb.answer("Нет доступа", show_alert=True); return
     key = generate_key()
     DATA["keys"][key] = {"permanent": True, "duration": 0,
                          "created_at": time.time(), "used_by": None}
     save_data(DATA)
-    await cb.message.edit_text(f"✅ *Перманентный ключ:*\n\n`{key}`\n\nАктивируется при первом вводе.")
+    await cb.message.edit_text(f"✅ *Перманентный:*\n\n`{key}`")
     await cb.answer()
 
 @dp.callback_query(F.data == "newkey_temp")
 async def cb_newkey_temp(cb: CallbackQuery, state: FSMContext):
-    if not _is_owner(cb):
+    if not is_owner(cb.from_user):
         await cb.answer("Нет доступа", show_alert=True); return
     await cb.message.edit_text(
-        "⏱ *Временный ключ*\n\n"
-        "Введите длительность: `1d 2h 30m`\n"
-        "• `d` — дни\n• `h` — часы\n• `m` — минуты\n• `s` — секунды\n\n"
-        "Пример: `2d 5h`, или `45m`, или `1h 30m`"
+        "⏱ Введите длительность: `1d 2h 30m`\n"
+        "• `d` — дни, `h` — часы, `m` — минуты, `s` — секунды\n\n"
+        "Пример: `2d 5h`, `45m`, `1h 30m`"
     )
     await state.set_state(BotStates.waiting_for_duration)
     await cb.answer()
 
 @dp.message(BotStates.waiting_for_duration)
 async def process_duration(message: Message, state: FSMContext):
-    if not _is_owner(message):
+    if not is_owner(message.from_user):
         await state.clear(); return
     duration = parse_duration(message.text or "")
     if not duration:
@@ -495,10 +604,7 @@ async def process_duration(message: Message, state: FSMContext):
     DATA["keys"][key] = {"permanent": False, "duration": duration,
                          "created_at": time.time(), "used_by": None}
     save_data(DATA)
-    await message.answer(
-        f"✅ *Временный ключ:*\n\n`{key}`\n\n⏱ *{format_duration(duration)}*\n"
-        f"⏳ Отсчёт начнётся с активации."
-    )
+    await message.answer(f"✅ *Временный:*\n\n`{key}`\n\n⏱ *{format_duration(duration)}*")
     await state.clear()
 
 @dp.message(F.text == "/cancel")
@@ -552,8 +658,7 @@ async def process_meta(message: Message, state: FSMContext):
     title, performer = [x.strip() for x in t.split("|", 1)]
     if not title:
         await message.answer("❌ Название пустое."); return
-    if not performer:
-        performer = "Unknown"
+    if not performer: performer = "Unknown"
     data = await state.get_data()
     ap = data.get("audio_path"); cp = data.get("cover_path")
     if not ap or not os.path.exists(ap):
@@ -662,7 +767,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
     loop = asyncio.get_event_loop()
-    is_tiktok = "tiktok.com" in url or "vm.tiktok.com" in url or "vt.tiktok.com" in url
+ ".    is_tiktok = "tiktok.com" in url or "vm.tiktok.com" in url or "vt.tiktok.com" in url
     is_youtube = "youtube.com" in url or "youtu.be" in url
 
     fn = None; tp = None
@@ -670,8 +775,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
         if is_tiktok:
             try: await status.edit_text("📥 Скачиваю TikTok...")
             except Exception: pass
-            fn, title, dur, _, _ = await loop.run_in_executor(
-                None, tiktok_via_api, url, mode)
+            fn, title, dur, _, _ = await loop.run_in_executor(None, tiktok_via_api, url, mode)
             if not os.path.exists(fn): raise FileNotFoundError(fn)
             if mode == "get_audio":
                 kw = {"audio": FSInputFile(fn, filename=f"{title}.mp3"),
@@ -721,7 +825,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
                     duration=int(dur) if dur else None)
             await status.delete(); return
 
-        # Остальное (IG/FB/...) через yt-dlp
+        # Остальное через yt-dlp
         opts = {
             "outtmpl": "downloads/%(id)s.%(ext)s",
             "quiet": True, "no_warnings": True, "noprogress": True,
@@ -741,14 +845,13 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
             fname = ydl.prepare_filename(info)
         base, _ = os.path.splitext(fname)
-        cands = [base + ".mp3", fname + ".mp3"] if mode == "get_audio" else \
+        cands = [base +mp3", fname + ".mp3"] if mode == "get_audio" else \
                 [fname, base + ".mp4", base + ".mkv", base + ".webm"]
         fn = next((p for p in cands if os.path.exists(p)), None)
         if not fn: raise FileNotFoundError(cands)
         dur = info.get("duration")
         title = clean_meta(info.get("title") or "media")
-        performer = clean_meta(
-            info.get("artist") or info.get("uploader") or "", max_len=64) or "Unknown"
+        performer = clean_meta(info.get("artist") or info.get("uploader") or "", max_len=64) or "Unknown"
         if mode == "get_audio":
             thumb_url = info.get("thumbnail")
             if thumb_url:
@@ -792,7 +895,6 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
 #   KEEP-ALIVE + ЗАПУСК
 # ============================================================
 async def keep_alive():
-    """Пингует Telegram каждые 4 минуты, чтобы контейнер не засыпал."""
     while True:
         try:
             await asyncio.sleep(240)
@@ -804,7 +906,6 @@ async def keep_alive():
 dp.message.middleware(AccessMiddleware())
 
 async def main():
-    print(f"👑 Владелец: @{OWNER_USERNAME}")
     print(f"🔑 Ключей: {len(DATA['keys'])}, юзеров: {len(DATA['users'])}")
     print("🚀 Бот успешно подключен к Telegram и слушает команды...")
     asyncio.create_task(keep_alive())
