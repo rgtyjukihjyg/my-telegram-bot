@@ -537,7 +537,8 @@ def split_image(image_path, total_parts):
             bottom = (row + 1) * ph if row < rows - 1 else h
             crop = img.crop((left, top, right, bottom))
             fn = f"temp_photos/part_{row}_{col}.jpg"
-            crop.save(fn, "JPEG", quality=95)
+            # Максимальное качество без субдискретизации — чтобы на стыках не было "плитки"
+            crop.save(fn, "JPEG", quality=100, subsampling=0)
             files.append(fn)
     return files
 
@@ -1480,10 +1481,8 @@ async def execute_splitting(msg_obj, state, pp, n):
         loop = asyncio.get_event_loop()
         parts = await loop.run_in_executor(None, split_image, pp, n)
 
-        # ЧИСЛОВАЯ сортировка: (row, col) — построчно, слева-направо.
-        # part_0_0 → part_0_1 → part_0_2 → part_1_0 → part_1_1 → ...
-        # Это правильный порядок: 1=левый верх, 2=центр верх, 3=правый верх,
-        # 4=левый второй ряд, 5=центр второй ряд, и т.д.
+        # Числовая сортировка (row, col) — правильный порядок:
+        # part_0_0 → part_0_1 → part_0_2 → part_1_0 → ...
         def sort_key(path):
             m = re.search(r'part_(\d+)_(\d+)', path)
             if m:
@@ -1494,25 +1493,17 @@ async def execute_splitting(msg_obj, state, pp, n):
         total = len(parts)
         print(f"split: {total} частей, порядок: {[os.path.basename(p) for p in parts[:6]]}...")
 
-        # Отправляем альбомами по 10 — порядок внутри альбома сохраняется
-        chunk_size = 10
-        for i in range(0, total, chunk_size):
-            group = parts[i:i + chunk_size]
-            media = []
-            for j, pf in enumerate(group):
-                if os.path.exists(pf):
-                    idx = i + j + 1
-                    media.append(InputMediaPhoto(
-                        media=FSInputFile(pf),
-                        caption=f"{idx}/{total}",
-                    ))
-            if not media:
+        # Отправляем как ДОКУМЕНТЫ — без сжатия. Telegram сжимает фото,
+        # из-за чего на стыках появляется "плитка" и меняется качество.
+        for i, pf in enumerate(parts):
+            if not os.path.exists(pf):
                 continue
-            if len(media) == 1:
-                await msg_obj.answer_photo(media[0].media, caption=media[0].caption)
-            else:
-                await msg_obj.answer_media_group(media)
-            await asyncio.sleep(0.6)
+            idx = i + 1
+            await msg_obj.answer_document(
+                FSInputFile(pf, filename=f"{idx:02d}.jpg"),
+                caption=f"{idx}/{total}",
+            )
+            await asyncio.sleep(0.4)
 
         # Удаляем временные файлы
         for pf in parts:
@@ -1525,7 +1516,8 @@ async def execute_splitting(msg_obj, state, pp, n):
         await st.delete()
         await msg_obj.answer(
             f"✅ Готово! {total} кусочков.\n"
-            f"Порядок: слева-направо, сверху-вниз (1/{total} → {total}/{total})."
+            f"Порядок: слева-направо, сверху-вниз (01 → {total:02d}).\n"
+            f"Скачай файлы и залей в профиль по порядку."
         )
     except Exception as e:
         print(f"split err: {e}")
