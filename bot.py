@@ -25,11 +25,12 @@ from aiogram.fsm.state import StatesGroup, State
 from PIL import Image
 import yt_dlp
 from static_ffmpeg import run as static_ffmpeg_run
-import edge_tts
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("нет BOT_TOKEN")
+
+STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID")
 
 OWNER_ID = 7752398574
 OWNER_USERNAME = (os.environ.get("OWNER_USERNAME") or "vimbrix").lower().lstrip("@")
@@ -46,6 +47,7 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 
 BOT_USERNAME_CACHE = None
+STT_MODEL = None
 
 
 class BotStates(StatesGroup):
@@ -54,7 +56,6 @@ class BotStates(StatesGroup):
     waiting_for_cover = State()
     waiting_for_meta = State()
     waiting_for_duration = State()
-    waiting_tts_text = State()
     waiting_sticker_name = State()
     waiting_sticker_title = State()
     waiting_sticker_first = State()
@@ -85,15 +86,15 @@ FUNNY_REPLIES = [
 ]
 
 
-TTS_VOICES = {
-    "ru_m1": ("ru-RU-DmitryNeural", "🇷🇺 Дмитрий (муж)"),
-    "ru_f1": ("ru-RU-SvetlanaNeural", "🇷🇺 Светлана (жен)"),
-    "en_m1": ("en-US-GuyNeural", "🇺🇸 Guy (male)"),
-    "en_f1": ("en-US-AriaNeural", "🇺🇸 Aria (female)"),
-}
+# ============================================================
+#                   ХРАНИЛИЩЕ (ФАЙЛ + TELEGRAM)
+# ============================================================
+
+def _empty_data():
+    return {"keys": {}, "users": {}, "sticker_packs": {}}
 
 
-def load_data():
+def load_data_from_file():
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -103,21 +104,113 @@ def load_data():
                 d.setdefault("sticker_packs", {})
                 return d
         except Exception as e:
-            print(f"load_data: {e}")
-    return {"keys": {}, "users": {}, "sticker_packs": {}}
+            print(f"load_data_from_file: {e}")
+    return _empty_data()
 
 
-def save_data(data):
+def save_data_to_file(data):
     try:
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, DATA_FILE)
     except Exception as e:
-        print(f"save_data: {e}")
+        print(f"save_data_to_file: {e}")
 
 
-DATA = load_data()
+async def load_data_from_tg():
+    if not STORAGE_CHAT_ID:
+        print("STORAGE_CHAT_ID не задан, читаю из файла")
+        return load_data_from_file()
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
+            async with s.get(url, params={"chat_id": STORAGE_CHAT_ID}) as r:
+                resp = await r.json()
+        if not resp.get("ok"):
+            print(f"load_data_from_tg getChat: {resp}")
+            return load_data_from_file()
+
+        pinned = resp["result"].get("pinned_message")
+        if not pinned or "document" not in pinned:
+            print("load_data_from_tg: нет закреплённого файла, читаю из file")
+            return load_data_from_file()
+
+        file_id = pinned["document"]["file_id"]
+        async with aiohttp.ClientSession() as s:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
+            async with s.get(url, params={"file_id": file_id}) as r:
+                fdata = await r.json()
+        if not fdata.get("ok"):
+            print(f"load_data_from_tg getFile: {fdata}")
+            return load_data_from_file()
+
+        file_path = fdata["result"]["file_path"]
+        async with aiohttp.ClientSession() as s:
+            url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            async with s.get(url) as r:
+                content = await r.read()
+
+        d = json.loads(content.decode("utf-8"))
+        d.setdefault("keys", {})
+        d.setdefault("users", {})
+        d.setdefault("sticker_packs", {})
+        print(f"load_data_from_tg OK: keys={len(d['keys'])}, users={len(d['users'])}")
+        save_data_to_file(d)
+        return d
+    except Exception as e:
+        print(f"load_data_from_tg err: {e}")
+        return load_data_from_file()
+
+
+async def save_data_to_tg(data):
+    save_data_to_file(data)
+    if not STORAGE_CHAT_ID:
+        return
+    try:
+        import aiohttp
+        content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        async with aiohttp.ClientSession() as s:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+            form = aiohttp.FormData()
+            form.add_field("chat_id", str(STORAGE_CHAT_ID))
+            form.add_field(
+                "document", content,
+                filename="data.json",
+                content_type="application/json",
+            )
+            form.add_field("disable_notification", "true")
+            async with s.post(url, data=form) as r:
+                resp = await r.json()
+        if not resp.get("ok"):
+            print(f"save_data_to_tg send: {resp}")
+            return
+        msg_id = resp["result"]["message_id"]
+        async with aiohttp.ClientSession() as s:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage"
+            async with s.post(url, data={
+                "chat_id": STORAGE_CHAT_ID,
+                "message_id": msg_id,
+                "disable_notification": True,
+            }) as r:
+                presp = await r.json()
+        if not presp.get("ok"):
+            print(f"save_data_to_tg pin: {presp}")
+    except Exception as e:
+        print(f"save_data_to_tg err: {e}")
+
+
+DATA = _empty_data()
+
+
+def save_data(data):
+    save_data_to_file(data)
+    if STORAGE_CHAT_ID:
+        try:
+            asyncio.create_task(save_data_to_tg(data))
+        except RuntimeError:
+            pass
 
 
 def is_owner(user) -> bool:
@@ -196,8 +289,7 @@ def user_status(user_id):
 
 
 PASSTHROUGH_COMMANDS = {
-    "/whoami", "/cancel", "/start", "/mykey", "/help", "/code",
-    "/tts", "/stickers", "/whisper",
+    "/whoami", "/cancel", "/start", "/mykey", "/help", "/code", "/whisper",
 }
 
 
@@ -288,6 +380,10 @@ FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_exec
 FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
 print(f"ffmpeg: {FFMPEG_EXE_PATH}")
 print(f"Owner: @{OWNER_USERNAME}")
+if STORAGE_CHAT_ID:
+    print(f"Storage chat: {STORAGE_CHAT_ID}")
+else:
+    print("Storage chat: НЕ ЗАДАН (данные будут теряться)")
 
 
 EMOJI_RE = re.compile(
@@ -486,43 +582,73 @@ def owner_reply_kb():
     )
 
 
-async def run_tts(text: str, voice: str, out_path: str):
-    communicate = edge_tts.Communicate(text, voice, rate="+0%", volume="+0%")
-    await communicate.save(out_path)
-    return out_path
+# ============================================================
+#              STT — АУДИО/ВИДЕО В ТЕКСТ (faster-whisper)
+# ============================================================
+
+def get_stt_model():
+    global STT_MODEL
+    if STT_MODEL is None:
+        print("Загружаю модель распознавания (первый раз долго)...")
+        from faster_whisper import WhisperModel
+        STT_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
+        print("Модель STT загружена")
+    return STT_MODEL
 
 
-def tts_voice_kb():
-    b = InlineKeyboardBuilder()
-    for key, (_, label) in TTS_VOICES.items():
-        b.button(text=label, callback_data=f"tts_voice:{key}")
-    b.adjust(2)
-    return b.as_markup()
-
-
-def convert_to_ogg(mp3_path: str, ogg_path: str):
-    cmd = [FFMPEG_EXE_PATH, "-y", "-i", mp3_path,
-           "-c:a", "libopus", "-b:a", "64k", ogg_path]
+def convert_to_wav(src_path: str, wav_path: str):
+    cmd = [FFMPEG_EXE_PATH, "-y", "-i", src_path,
+           "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav_path]
     r = subprocess.run(cmd, capture_output=True, text=True,
                        encoding="utf-8", errors="ignore")
     if r.returncode != 0:
-        raise RuntimeError(r.stderr[-300:] if r.stderr else "ogg convert err")
-    return ogg_path
+        raise RuntimeError(r.stderr[-300:] if r.stderr else "wav convert err")
+    return wav_path
 
 
-def photo_to_webp_sticker(src_path: str, dst_path: str):
-    img = Image.open(src_path).convert("RGBA")
-    w, h = img.size
-    side = max(w, h)
-    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-    canvas.paste(img, ((side - w) // 2, (side - h) // 2))
-    canvas = canvas.resize((512, 512), Image.LANCZOS)
-    canvas.save(dst_path, "WEBP", quality=95, method=6)
-    return dst_path
+def transcribe_wav(wav_path: str):
+    model = get_stt_model()
+    segments, info = model.transcribe(wav_path, beam_size=1, vad_filter=True)
+    text = " ".join(s.text.strip() for s in segments).strip()
+    return text, info.language
 
 
-def validate_pack_shortname(name: str) -> bool:
-    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9_]{0,50}$", name))
+def _stt_pipeline(src_path: str, wav_path: str):
+    convert_to_wav(src_path, wav_path)
+    return transcribe_wav(wav_path)
+
+
+async def _handle_stt(message: Message, file_id: str, ext_hint: str = ".ogg"):
+    fi = await bot.get_file(file_id)
+    src = f"downloads/stt_{file_id}{ext_hint}"
+    wav = f"downloads/stt_{file_id}.wav"
+    await bot.download_file(fi.file_path, src)
+
+    status = await message.answer("📝 Слушаю... расшифровываю.")
+    try:
+        loop = asyncio.get_event_loop()
+        text, lang = await loop.run_in_executor(None, _stt_pipeline, src, wav)
+        if not text:
+            await status.edit_text("🤷 Не разобрал ни слова. Может, тихо записано?")
+        else:
+            preview = text if len(text) <= 3900 else text[:3900] + "..."
+            await status.edit_text(
+                f"📝 Расшифровка (язык: {lang}):\n\n{preview}"
+            )
+    except Exception as e:
+        err = str(e)[:300]
+        print(f"stt err: {err}")
+        try:
+            await status.edit_text(f"😔 Не получилось расшифровать:\n{err}")
+        except Exception:
+            await message.answer(f"😔 Не получилось расшифровать:\n{err}")
+    finally:
+        for p in (src, wav):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
 
 # ============================================================
@@ -547,12 +673,11 @@ async def cmd_start(message: Message):
         "📷 Фото — режу на части 3×N\n"
         "🎬 TikTok — качаю видео или вытаскиваю звук\n"
         "🎵 Аудио — ставлю обложку, название, исполнителя\n"
-        "🎙 Озвучка — текст превращаю в голос\n"
+        "🎤 Голосовое — расшифровываю в текст\n"
         "🎨 Стикерпаки — собираю твои стикеры\n"
         f"🤫 Шёпот — в чате напиши `@{bot_uname} текст @username`\n\n"
         "📖 Команды:\n"
         "/help — помощь\n"
-        "/tts — озвучка текста\n"
         "/stickers — стикерпаки\n"
         "/whisper — как отправить шёпот\n"
         "/mykey — мой ключ\n"
@@ -575,7 +700,7 @@ async def cmd_help(message: Message):
     bot_uname = await get_bot_username()
     await message.answer(
         "📖 *Что умею:*\n\n"
-        "🎙 `/tts` — озвучить текст\n"
+        "🎤 *Голосовое / кружок* — расшифрую в текст\n"
         "🎨 `/stickers` — стикерпаки\n"
         "🤫 `/whisper` — как отправить шёпот\n"
         "🔑 `/mykey` — статус ключа\n\n"
@@ -743,83 +868,21 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await message.answer("👌 Отменил.")
 
 
-# ============================================================
-#                         TTS
-# ============================================================
+# --- STT: голосовое и видеокружок ---
 
-@dp.message(F.text == "/tts")
-async def cmd_tts(message: Message, state: FSMContext):
+@dp.message(F.voice)
+async def process_voice(message: Message, state: FSMContext):
     await state.set_state(None)
-    await message.answer("🎙 Выбери голос:", reply_markup=tts_voice_kb())
+    await _handle_stt(message, message.voice.file_id, ".ogg")
 
 
-@dp.callback_query(F.data.startswith("tts_voice:"))
-async def cb_tts_voice(cb: CallbackQuery, state: FSMContext):
-    voice_key = cb.data.split(":", 1)[1]
-    if voice_key not in TTS_VOICES:
-        await cb.answer("Такого голоса нет.", show_alert=True)
-        return
-    await state.update_data(tts_voice=voice_key)
-    await state.set_state(BotStates.waiting_tts_text)
-    await cb.message.edit_text(
-        f"🎙 Голос: {TTS_VOICES[voice_key][1]}\n\n"
-        f"Пришли текст — озвучу. До 1000 символов."
-    )
-    await cb.answer()
+@dp.message(F.video_note)
+async def process_video_note(message: Message, state: FSMContext):
+    await state.set_state(None)
+    await _handle_stt(message, message.video_note.file_id, ".mp4")
 
 
-@dp.message(BotStates.waiting_tts_text)
-async def process_tts_text(message: Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("⚠️ Пустой текст.")
-        return
-    if len(text) > 1000:
-        await message.answer(f"⚠️ Слишком много: {len(text)} символов. Максимум 1000.")
-        return
-    data = await state.get_data()
-    voice_key = data.get("tts_voice", "ru_f1")
-    voice_id, voice_label = TTS_VOICES[voice_key]
-
-    status = await message.answer("🎙 Генерирую...")
-    mp3_path = f"downloads/tts_{message.from_user.id}_{int(time.time())}.mp3"
-    ogg_path = f"downloads/tts_{message.from_user.id}_{int(time.time())}.ogg"
-    try:
-        await run_tts(text, voice_id, mp3_path)
-        if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) < 100:
-            raise RuntimeError("пустой файл от edge-tts")
-
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, convert_to_ogg, mp3_path, ogg_path)
-        dur = await loop.run_in_executor(None, get_duration, ogg_path)
-
-        kw = {
-            "voice": FSInputFile(ogg_path, filename="voice.ogg"),
-            "caption": f"🎙 Голос: {voice_label}",
-        }
-        if dur:
-            kw["duration"] = int(dur)
-        await message.answer_voice(**kw)
-        await status.delete()
-    except Exception as e:
-        err = str(e)[:300]
-        try:
-            await status.edit_text(f"😔 Не получилось озвучить:\n{err}")
-        except Exception:
-            await message.answer(f"😔 Не получилось озвучить:\n{err}")
-    finally:
-        for p in (mp3_path, ogg_path):
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-        await state.clear()
-
-
-# ============================================================
-#                    ШЁПОТ (INLINE MODE)
-# ============================================================
+# --- Whisper inline ---
 
 @dp.message(F.text == "/whisper")
 async def cmd_whisper(message: Message):
@@ -1003,9 +1066,7 @@ async def cb_whisper_help(cb: CallbackQuery):
     )
 
 
-# ============================================================
-#                       СТИКЕРПАКИ
-# ============================================================
+# --- Стикерпаки ---
 
 @dp.message(F.text == "/stickers")
 async def cmd_stickers(message: Message, state: FSMContext):
@@ -1095,7 +1156,6 @@ async def process_sticker_first(message: Message, state: FSMContext):
             raise RuntimeError("не удалось создать webp")
         with open(dst, "rb") as f:
             sticker_bytes = f.read()
-        print(f"sticker size: {len(sticker_bytes)} bytes")
         if len(sticker_bytes) > 512 * 1024:
             raise RuntimeError("стикер больше 512 КБ")
 
@@ -1255,9 +1315,7 @@ async def wrong_sticker_add(message: Message):
     await message.answer("🖼 Нужна именно картинка.")
 
 
-# ============================================================
-#                    РАБОТА С МЕДИА
-# ============================================================
+# --- Медиа ---
 
 @dp.message(F.audio)
 async def process_audio_for_tag(message: Message, state: FSMContext):
@@ -1349,11 +1407,6 @@ async def process_meta(message: Message, state: FSMContext):
                 except Exception:
                     pass
         await state.clear()
-
-
-@dp.message(F.voice | F.video_note)
-async def reject_voice(message: Message):
-    await message.answer("🙈 Голосовые и кружки пока не расшифровываю.")
 
 
 @dp.message(F.photo)
@@ -1541,7 +1594,6 @@ async def set_bot_commands():
         BotCommand(command="help", description="Помощь"),
         BotCommand(command="code", description="Активировать ключ"),
         BotCommand(command="mykey", description="Мой ключ"),
-        BotCommand(command="tts", description="Озвучить текст"),
         BotCommand(command="stickers", description="Стикерпаки"),
         BotCommand(command="whisper", description="Как отправить шёпот"),
         BotCommand(command="cancel", description="Отменить действие"),
@@ -1561,26 +1613,25 @@ async def set_bot_menu():
         print(f"set_chat_menu_button err: {e}")
 
 
-async def test_tts():
+async def preload_stt():
     try:
-        test_path = "downloads/test_tts.mp3"
-        await run_tts("тест", "ru-RU-DmitryNeural", test_path)
-        size = os.path.getsize(test_path) if os.path.exists(test_path) else 0
-        print(f"TTS test: {size} bytes")
-        if os.path.exists(test_path):
-            os.remove(test_path)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, get_stt_model)
     except Exception as e:
-        print(f"TTS test failed: {e}")
+        print(f"STT preload failed: {e}")
 
 
 dp.message.middleware(AccessMiddleware())
 
 
 async def main():
+    global DATA
+    DATA = await load_data_from_tg()
     print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}")
     await set_bot_commands()
     await set_bot_menu()
-    await test_tts()
+    # STT грузим в фоне, чтобы не тормозить старт
+    asyncio.create_task(preload_stt())
     print("Bot started")
     asyncio.create_task(keep_alive())
     await dp.start_polling(bot)
