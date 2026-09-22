@@ -148,7 +148,6 @@ def user_status(user_id):
     return "expired"
 
 
-# /start, /mykey, /whoami, /cancel видны всем — без ключа
 PASSTHROUGH_COMMANDS = {"/whoami", "/cancel", "/start", "/mykey", "/help"}
 
 
@@ -173,8 +172,10 @@ class AccessMiddleware(BaseMiddleware):
             save_data(DATA)
             await event.answer("Срок действия ключа истёк. Введите новый.")
             return
-        if text and len(text) == KEY_LENGTH and text.isalnum() and text.isupper():
-            await try_activate_key(event, user, text)
+        # Толерантный парсер ключа: убираем бэктики, пробелы, приводим к верхнему регистру
+        candidate = text.strip().strip("`").strip().upper()
+        if len(candidate) == KEY_LENGTH and candidate.isalnum():
+            await try_activate_key(event, user, candidate)
             return
         await event.answer("Доступ только по ключу. Отправьте ключ одним сообщением.")
 
@@ -301,10 +302,10 @@ def youtube_download(url, mode):
         "noprogress": True,
         "noplaylist": True,
         "ffmpeg_location": FFMPEG_DIR,
+        # Пробуем несколько клиентов — web/mweb/tv. tv самый стабильный.
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb"],
-                "youtubepot-bgutilscript": {},
+                "player_client": ["web", "mweb", "tv"],
             }
         },
     }
@@ -572,7 +573,7 @@ async def cb_newkey_perm(cb: CallbackQuery):
         "used_by": None,
     }
     save_data(DATA)
-    await cb.message.edit_text(f"Перманентный ключ:\n`{key}`")
+    await cb.message.edit_text(f"Перманентный ключ:\n{key}")
 
 
 @dp.callback_query(F.data == "newkey_temp")
@@ -604,7 +605,7 @@ async def process_duration(message: Message, state: FSMContext):
         "used_by": None,
     }
     save_data(DATA)
-    await message.answer(f"Временный ключ: `{key}`\n{format_duration(duration)}")
+    await message.answer(f"Временный ключ: {key}\n{format_duration(duration)}")
     await state.clear()
 
 
