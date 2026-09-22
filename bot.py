@@ -166,10 +166,10 @@ class AccessMiddleware(BaseMiddleware):
         if status == "expired":
             DATA["users"].pop(str(user.id), None)
             save_data(DATA)
-            await event.answer("Срок действия ключа истёк. Введи новый через /code.")
+            await event.answer("⏰ Срок действия ключа истёк. Введи новый через /code.")
             return
         await event.answer(
-            "Доступ только по ключу.\n"
+            "🔒 Доступ только по ключу.\n"
             "Отправь: /code ТВОЙ_КЛЮЧ"
         )
 
@@ -178,18 +178,18 @@ async def try_activate_key(event, user, key):
     key_data = DATA["keys"].get(key)
     user_id = str(user.id)
     if not key_data:
-        await event.answer("Такого ключа нет. Проверь раскладку и регистр.")
+        await event.answer("❌ Такого ключа нет. Проверь раскладку и регистр.")
         return
     used_by = key_data.get("used_by")
     if used_by is not None:
         if str(used_by) == user_id:
             u = DATA["users"].get(user_id, {})
             if u.get("permanent"):
-                await event.answer("Ты уже активировал этот ключ.")
+                await event.answer("😉 Ты уже активировал этот ключ.")
             else:
-                await event.answer(f"Уже активирован. До {format_until(u.get('expires_at', 0))}")
+                await event.answer(f"😉 Уже активирован. До {format_until(u.get('expires_at', 0))}")
         else:
-            await event.answer("Этот ключ уже занят другим аккаунтом.")
+            await event.answer("⚠️ Этот ключ уже занят другим аккаунтом.")
         return
     now = time.time()
     permanent = bool(key_data.get("permanent"))
@@ -207,11 +207,11 @@ async def try_activate_key(event, user, key):
     DATA["users"][user_id] = entry
     save_data(DATA)
     if permanent:
-        await event.answer("Ключ активирован. Доступ навсегда.")
+        await event.answer("✅ Готово! Ключ активирован навсегда.")
     else:
         await event.answer(
-            f"Ключ активирован на {format_duration(duration)}.\n"
-            f"Действует до {format_until(now + duration)}."
+            f"✅ Ключ активирован на {format_duration(duration)}\n"
+            f"📅 Действует до {format_until(now + duration)}"
         )
 
 
@@ -451,32 +451,33 @@ async def cmd_whoami(message: Message):
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     text = (
-        "Привет. Что я умею:\n\n"
-        "— Фото: режу на части 3×N\n"
-        "— TikTok: качаю видео или вытаскиваю звук\n"
-        "— Аудио: ставлю обложку, название, исполнителя\n"
-        "— Другие ссылки (VK, Rutube и т.п.): попробую скачать\n\n"
-        "YouTube не поддерживаю — с сервера он не качается.\n\n"
-        "Отправь /code ТВОЙ_КЛЮЧ, чтобы начать."
+        "👋 Привет! Что я умею:\n\n"
+        "📷 Фото — режу на части 3×N\n"
+        "🎬 TikTok — качаю видео или вытаскиваю звук\n"
+        "🎵 Аудио — ставлю обложку, название, исполнителя\n"
+        "🔗 Другие ссылки (VK, Rutube и т.п.) — попробую скачать\n\n"
+        "⚠️ YouTube не поддерживаю — с сервера он не качается.\n\n"
+        "🔑 Отправь /code ТВОЙ_КЛЮЧ, чтобы начать."
     )
     if is_owner(message.from_user):
         await message.answer(
-            text + "\n\nАдмин-панель включена — кнопки снизу.",
+            text + "\n\n👑 Админ-панель включена — кнопки снизу.",
             reply_markup=owner_reply_kb(),
+            parse_mode=None,
         )
     else:
-        await message.answer(text)
+        await message.answer(text, parse_mode=None)
 
 
 @dp.message(F.text.startswith("/code"))
 async def cmd_code(message: Message):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Формат: /code ТВОЙ_КЛЮЧ")
+        await message.answer("⚠️ Формат: /code ТВОЙ_КЛЮЧ")
         return
     key = parts[1].strip().strip("`").strip().upper()
     if len(key) != KEY_LENGTH or not key.isalnum():
-        await message.answer("Ключ выглядит странно. Проверь, что скопировал полностью.")
+        await message.answer("❌ Ключ выглядит странно. Проверь, что скопировал полностью.")
         return
     await try_activate_key(message, message.from_user, key)
 
@@ -486,17 +487,17 @@ async def cmd_mykey(message: Message):
     user_id = str(message.from_user.id)
     u = DATA["users"].get(user_id)
     if not u:
-        await message.answer("У тебя пока нет активного ключа.")
+        await message.answer("🤷 У тебя пока нет активного ключа.")
         return
     if u.get("permanent"):
-        await message.answer(f"Твой ключ: {u.get('key')}\nТип: навсегда")
+        await message.answer(f"🔑 Твой ключ: {u.get('key')}\n♾ Тип: навсегда")
     else:
         exp = u.get("expires_at", 0)
         rem = max(0, exp - time.time())
         await message.answer(
-            f"Твой ключ: {u.get('key')}\n"
-            f"До: {format_until(exp)}\n"
-            f"Осталось: {format_duration(rem)}"
+            f"🔑 Твой ключ: {u.get('key')}\n"
+            f"📅 До: {format_until(exp)}\n"
+            f"⏳ Осталось: {format_duration(rem)}"
         )
 
 
@@ -507,7 +508,7 @@ async def cmd_newkey(message: Message):
     b = InlineKeyboardBuilder()
     b.button(text="♾ Навсегда", callback_data="newkey_perm")
     b.button(text="⏳ На время", callback_data="newkey_temp")
-    await message.answer("Какой ключ делаем?", reply_markup=b.as_markup())
+    await message.answer("❓ Какой ключ делаем?", reply_markup=b.as_markup())
 
 
 @dp.message(F.text == "/keys")
@@ -524,7 +525,7 @@ async def btn_newkey(message: Message):
     b = InlineKeyboardBuilder()
     b.button(text="♾ Навсегда", callback_data="newkey_perm")
     b.button(text="⏳ На время", callback_data="newkey_temp")
-    await message.answer("Какой ключ делаем?", reply_markup=b.as_markup())
+    await message.answer("❓ Какой ключ делаем?", reply_markup=b.as_markup())
 
 
 @dp.message(F.text == "📋 Статусы ключей")
@@ -537,32 +538,32 @@ async def btn_keys(message: Message):
 async def _send_keys_list(message: Message):
     keys = DATA["keys"]
     if not keys:
-        await message.answer("Пока ни одного ключа нет.")
+        await message.answer("🗂 Пока ни одного ключа нет.")
         return
-    lines = ["Все ключи:\n"]
+    lines = ["🗂 Все ключи:\n"]
     for k, kd in keys.items():
         if kd.get("used_by"):
             u = DATA["users"].get(str(kd["used_by"]), {})
             uname = u.get("username") or "?"
             if u.get("permanent"):
-                status = "активен (навсегда)"
+                status = "♾ активен"
             elif u.get("expires_at", 0) > time.time():
-                status = f"до {format_until(u.get('expires_at', 0))}"
+                status = f"⏳ до {format_until(u.get('expires_at', 0))}"
             else:
-                status = "истёк"
+                status = "❌ истёк"
             lines.append(f"{k} → @{uname} ({status})")
         else:
             if kd.get("permanent"):
-                lines.append(f"{k} — свободен (навсегда)")
+                lines.append(f"{k} — ♾ свободен")
             else:
-                lines.append(f"{k} — свободен ({format_duration(kd.get('duration', 0))})")
+                lines.append(f"{k} — ⏳ {format_duration(kd.get('duration', 0))}, свободен")
     await message.answer("\n".join(lines))
 
 
 @dp.callback_query(F.data == "newkey_perm")
 async def cb_newkey_perm(cb: CallbackQuery):
     if not is_owner(cb.from_user):
-        await cb.answer("Не твоя кнопка", show_alert=True)
+        await cb.answer("🙅 Не твоя кнопка", show_alert=True)
         return
     key = generate_key()
     DATA["keys"][key] = {
@@ -572,18 +573,17 @@ async def cb_newkey_perm(cb: CallbackQuery):
         "used_by": None,
     }
     save_data(DATA)
-    await cb.message.edit_text(f"Перманентный ключ:\n{key}\n\nОтправь его юзеру.")
+    await cb.message.edit_text(f"♾ Перманентный ключ:\n{key}\n\n📤 Отправь его юзеру.")
 
 
 @dp.callback_query(F.data == "newkey_temp")
 async def cb_newkey_temp(cb: CallbackQuery, state: FSMContext):
     if not is_owner(cb.from_user):
-        await cb.answer("Не твоя кнопка", show_alert=True)
+        await cb.answer("🙅 Не твоя кнопка", show_alert=True)
         return
     await cb.message.edit_text(
-        "Сколько должен жить ключ?\n"
-        "Примеры: 1d (день), 12h (12 часов), 1d 2h 30m.\n"
-        "d — дни, h — часы, m — минуты, s — секунды."
+        "⏳ Введи длительность: 1d 2h 30m\n"
+        "(d — дни, h — часы, m — минуты, s — секунды)"
     )
     await state.set_state(BotStates.waiting_for_duration)
 
@@ -595,7 +595,7 @@ async def process_duration(message: Message, state: FSMContext):
         return
     duration = parse_duration(message.text or "")
     if not duration:
-        await message.answer("Не понял. Попробуй так: 1d 2h 30m")
+        await message.answer("🤔 Не понял. Попробуй так: 1d 2h 30m")
         return
     key = generate_key()
     DATA["keys"][key] = {
@@ -606,7 +606,7 @@ async def process_duration(message: Message, state: FSMContext):
     }
     save_data(DATA)
     await message.answer(
-        f"Временный ключ:\n{key}\nЖивёт {format_duration(duration)}."
+        f"⏳ Временный ключ:\n{key}\n⏱ Живёт {format_duration(duration)}"
     )
     await state.clear()
 
@@ -622,7 +622,7 @@ async def cmd_cancel(message: Message, state: FSMContext):
             except Exception:
                 pass
     await state.clear()
-    await message.answer("Отменил.")
+    await message.answer("👌 Отменил.")
 
 
 # ============================================================
@@ -646,7 +646,7 @@ async def process_audio_for_tag(message: Message, state: FSMContext):
     await bot.download_file(fi.file_path, lp)
     await state.update_data(audio_path=lp)
     await state.set_state(BotStates.waiting_for_cover)
-    await message.answer("Кидай обложку — картинку для этого трека.")
+    await message.answer("🎨 Кидай обложку — картинку для этого трека.")
 
 
 @dp.message(BotStates.waiting_for_cover, F.photo)
@@ -658,25 +658,25 @@ async def process_cover(message: Message, state: FSMContext):
     await state.update_data(cover_path=cp)
     await state.set_state(BotStates.waiting_for_meta)
     await message.answer(
-        "Теперь название и исполнитель через палочку:\n"
+        "✍️ Теперь название и исполнитель через палочку:\n"
         "Название | Исполнитель"
     )
 
 
 @dp.message(BotStates.waiting_for_cover)
 async def wrong_cover(message: Message):
-    await message.answer("Нужна именно картинка.")
+    await message.answer("📷 Нужна именно картинка.")
 
 
 @dp.message(BotStates.waiting_for_meta)
 async def process_meta(message: Message, state: FSMContext):
     t = (message.text or "").strip()
     if "|" not in t:
-        await message.answer("Формат такой: Название | Исполнитель")
+        await message.answer("⚠️ Формат такой: Название | Исполнитель")
         return
     title, performer = [x.strip() for x in t.split("|", 1)]
     if not title:
-        await message.answer("Название-то пустое.")
+        await message.answer("⚠️ Название-то пустое.")
         return
     if not performer:
         performer = "Unknown"
@@ -684,10 +684,10 @@ async def process_meta(message: Message, state: FSMContext):
     ap = data.get("audio_path")
     cp = data.get("cover_path")
     if not ap or not os.path.exists(ap):
-        await message.answer("Аудио пропало. Давай заново.")
+        await message.answer("🤷 Аудио пропало. Давай заново.")
         await state.clear()
         return
-    status = await message.answer("Ставлю метки...")
+    status = await message.answer("🎧 Ставлю метки...")
     out = None
     try:
         loop = asyncio.get_event_loop()
@@ -697,7 +697,7 @@ async def process_meta(message: Message, state: FSMContext):
             "audio": FSInputFile(out, filename=f"{title}.mp3"),
             "title": title,
             "performer": performer,
-            "caption": "Готово. Забирай.",
+            "caption": "✅ Готово! Забирай.",
         }
         if dur:
             kw["duration"] = int(dur)
@@ -708,9 +708,9 @@ async def process_meta(message: Message, state: FSMContext):
     except Exception as e:
         err = str(e)[:300]
         try:
-            await status.edit_text(f"Ошибка: {err}")
+            await status.edit_text(f"❌ Ошибка: {err}")
         except Exception:
-            await message.answer(f"Ошибка: {err}")
+            await message.answer(f"❌ Ошибка: {err}")
     finally:
         for p in (ap, cp, out):
             if p and os.path.exists(p):
@@ -723,7 +723,7 @@ async def process_meta(message: Message, state: FSMContext):
 
 @dp.message(F.voice | F.video_note)
 async def reject_voice(message: Message):
-    await message.answer("Голосовые и кружки не поддерживаю.")
+    await message.answer("🙈 Голосовые и кружки не поддерживаю.")
 
 
 @dp.message(F.photo)
@@ -735,9 +735,9 @@ async def process_photo(message: Message, state: FSMContext):
     await state.update_data(photo_path=lp)
     await state.set_state(BotStates.waiting_for_parts)
     b = InlineKeyboardBuilder()
-    b.button(text="На твоё усмотрение", callback_data="auto_split")
+    b.button(text="🎲 На твоё усмотрение", callback_data="auto_split")
     await message.answer(
-        "На сколько кусочков резать?\n"
+        "✂️ На сколько кусочков резать?\n"
         "Число должно делиться на 3 (например, 6, 9, 12).\n"
         "Или жми кнопку — сам прикину.",
         reply_markup=b.as_markup(),
@@ -755,7 +755,7 @@ async def auto_split(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_reply_markup(reply_markup=None)
     loop = asyncio.get_event_loop()
     n = await loop.run_in_executor(None, calculate_auto_parts, pp)
-    await cb.message.answer(f"Прикинул: {n} кусочков.")
+    await cb.message.answer(f"🎲 Прикинул: {n} кусочков.")
     await execute_splitting(cb.message, state, pp, n)
     await cb.answer()
 
@@ -763,18 +763,18 @@ async def auto_split(cb: CallbackQuery, state: FSMContext):
 @dp.message(BotStates.waiting_for_parts)
 async def process_parts(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
-        await message.answer("Нужно число цифрами.")
+        await message.answer("❗ Нужно число цифрами.")
         return
     n = int(message.text)
     if n < 3 or n % 3 != 0:
-        await message.answer("Число должно делиться на 3. Попробуй ещё раз.")
+        await message.answer("⚠️ Число должно делиться на 3. Попробуй ещё раз.")
         return
     d = await state.get_data()
     await execute_splitting(message, state, d.get("photo_path"), n)
 
 
 async def execute_splitting(msg_obj, state, pp, n):
-    st = await msg_obj.answer("Режу...")
+    st = await msg_obj.answer("🔪 Режу...")
     try:
         loop = asyncio.get_event_loop()
         parts = await loop.run_in_executor(None, split_image, pp, n)
@@ -783,9 +783,9 @@ async def execute_splitting(msg_obj, state, pp, n):
                 await msg_obj.answer_photo(FSInputFile(pf))
                 os.remove(pf)
         await st.delete()
-        await msg_obj.answer("Готово. Держи свои кусочки.")
+        await msg_obj.answer("✅ Готово! Держи свои кусочки.")
     except Exception as e:
-        await msg_obj.answer(f"Что-то пошло не так: {e}")
+        await msg_obj.answer(f"❌ Что-то пошло не так: {e}")
     finally:
         if os.path.exists(pp):
             os.remove(pp)
@@ -797,16 +797,16 @@ async def ask_type(message: Message, state: FSMContext):
     url = message.text.strip()
     if "youtube.com" in url or "youtu.be" in url:
         await message.answer(
-            "С YouTube не могу качать — сервер блокируется.\n"
+            "⚠️ С YouTube не могу качать — сервер блокируется.\n"
             "Попробуй TikTok или другую ссылку."
         )
         return
     await state.update_data(download_url=url)
     await state.set_state(BotStates.waiting_for_media_type)
     b = InlineKeyboardBuilder()
-    b.button(text="Только звук (MP3)", callback_data="get_audio")
-    b.button(text="Видео (MP4)", callback_data="get_video")
-    await message.answer("Что вытащить из ссылки?", reply_markup=b.as_markup())
+    b.button(text="🎵 Только звук (MP3)", callback_data="get_audio")
+    b.button(text="🎬 Видео (MP4)", callback_data="get_video")
+    await message.answer("❓ Что вытащить из ссылки?", reply_markup=b.as_markup())
 
 
 @dp.callback_query(F.data.in_({"get_audio", "get_video"}), BotStates.waiting_for_media_type)
@@ -815,7 +815,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
     url = d.get("download_url")
     mode = cb.data
     await cb.message.edit_reply_markup(reply_markup=None)
-    status = await cb.message.answer("Секунду, качаю...")
+    status = await cb.message.answer("⏳ Секунду, качаю...")
     await cb.answer()
 
     loop = asyncio.get_event_loop()
@@ -826,13 +826,13 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
     try:
         if is_tiktok:
             try:
-                await status.edit_text("Тяну с TikTok...")
+                await status.edit_text("📥 Тяну с TikTok...")
             except Exception:
                 pass
             fn, title, dur, _, _ = await loop.run_in_executor(None, tiktok_via_api, url, mode)
         else:
             try:
-                await status.edit_text("Пробую скачать...")
+                await status.edit_text("📥 Пробую скачать...")
             except Exception:
                 pass
             fn, title, dur, performer, thumb_url = await loop.run_in_executor(
@@ -863,7 +863,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
             kw = {
                 "audio": FSInputFile(fn, filename=f"{title}.mp3"),
                 "title": title,
-                "caption": "Готово, забирай звук.",
+                "caption": "🎵 Готово, забирай звук.",
             }
             if dur:
                 kw["duration"] = int(dur)
@@ -873,7 +873,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
         else:
             await cb.message.answer_video(
                 video=FSInputFile(fn, filename=f"{title}.mp4"),
-                caption="Готово, приятного просмотра.",
+                caption="🎬 Готово, приятного просмотра.",
                 duration=int(dur) if dur else None,
             )
         await status.delete()
@@ -882,9 +882,9 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
         print(f"err: {e}")
         err = str(e)[:300]
         try:
-            await status.edit_text(f"Не получилось скачать.\n{err}")
+            await status.edit_text(f"😔 Не получилось скачать.\n{err}")
         except Exception:
-            await cb.message.answer(f"Не получилось скачать.\n{err}")
+            await cb.message.answer(f"😔 Не получилось скачать.\n{err}")
     finally:
         for p in (fn, tp):
             if p and os.path.exists(p):
