@@ -4,3 +4,4 @@ yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 bgutil-ytdlp-pot-provider
 static-ffmpeg
 pillow
+edge-tts
