@@ -1,6 +1,6 @@
 aiogram>=3.7.0
 aiohttp>=3.9.0
-yt-dlp
+yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 bgutil-ytdlp-pot-provider
 static-ffmpeg
 pillow
