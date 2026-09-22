@@ -5,7 +5,6 @@
 #HttpOnly_.youtube.com	FALSE	/	TRUE	0	GPS	1
 #HttpOnly_.youtube.com	FALSE	/	TRUE	1790145889	YSC	-Wk-aAh-0AI
 #HttpOnly_.youtube.com	FALSE	/	TRUE	0	__Secure-ROLLOUT_TOKEN	CIS_15_FmuvmkwEQ7NHR_ciBlwMY_9Ks_siBlwM%3D
-#HttpOnly_.youtube.com	FALSE	/	TRUE	0	__Secure-YNID	21.YT=HEHt5rxZUADKYprYS4RZEJdziNylwdk-zhB-hH3OK-8FF-Jon29dFHmrs6Fmi93NXB_z2YtwPqk8MjLK2rM-72oq60XcJdtmARbj_01UotXATlQ37vI2Yvd5Orkyauj5-J2XUSMp7d6i2-ypoj23D77HOj6Nxtj53cC-pzrx-xoOeXcccf7cKbyseK-khv_4LHwISOkNT1GyKaLQN6wH9_ITALFlm2DK8_gEJyX0EOZgM-k6nc4_WAgOV6B61MAW09OGy_m55_wjlZpv5iLr1vTLH614eWjWxiDexCOxKaY8Dq6kZH62tOSY-c3BOl1EFnG7W56aKrxutHIaoMWQlA
 .youtube.com	FALSE	/	TRUE	0	CONSENT	YES+WIPR
 .youtube.com	FALSE	/	TRUE	0	PREF	tz=Asia.Chita
 .youtube.com	FALSE	/	TRUE	0	SOCS	CAISEwgDEgk5ODQ5ODgzNzYaAnJ1IAEaBgiAisfVBg
