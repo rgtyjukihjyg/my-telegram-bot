@@ -32,7 +32,6 @@ if _env_id and _env_id.strip().isdigit():
     OWNER_ID = int(_env_id)
 
 DATA_FILE = "data.json"
-COOKIES_FILE = "cookies.txt"
 KEY_LENGTH = 12
 KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -84,9 +83,6 @@ def is_owner(user) -> bool:
     if OWNER_ID is not None and user.id == OWNER_ID:
         return True
     return (user.username or "").lower() == OWNER_USERNAME
-
-
-COOKIES_PATH = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
 
 
 def generate_key():
@@ -170,32 +166,34 @@ class AccessMiddleware(BaseMiddleware):
         if status == "expired":
             DATA["users"].pop(str(user.id), None)
             save_data(DATA)
-            await event.answer("Срок действия ключа истёк. Введите новый.")
+            await event.answer("⏰ Твой ключ истёк. Скинь новый — и продолжим.")
             return
-        # Толерантный парсер ключа: убираем бэктики, пробелы, приводим к верхнему регистру
         candidate = text.strip().strip("`").strip().upper()
         if len(candidate) == KEY_LENGTH and candidate.isalnum():
             await try_activate_key(event, user, candidate)
             return
-        await event.answer("Доступ только по ключу. Отправьте ключ одним сообщением.")
+        await event.answer(
+            "🔒 Тут вход по ключу.\n"
+            "Кинь ключ одним сообщением — и погнали."
+        )
 
 
 async def try_activate_key(event, user, key):
     key_data = DATA["keys"].get(key)
     user_id = str(user.id)
     if not key_data:
-        await event.answer("Неверный ключ.")
+        await event.answer("🤔 Такого ключа у меня нет. Проверь, всё ли верно.")
         return
     used_by = key_data.get("used_by")
     if used_by is not None:
         if str(used_by) == user_id:
             u = DATA["users"].get(user_id, {})
             if u.get("permanent"):
-                await event.answer("Вы уже активировали этот ключ.")
+                await event.answer("😉 Ты уже активировал этот ключ.")
             else:
-                await event.answer(f"Уже активирован. До: {format_until(u.get('expires_at', 0))}")
+                await event.answer(f"Ты уже активировал его. Работает до {format_until(u.get('expires_at', 0))}")
         else:
-            await event.answer("Этот ключ уже использован другим аккаунтом.")
+            await event.answer("🚫 Этот ключ уже кто-то занял. Возьми другой.")
         return
     now = time.time()
     permanent = bool(key_data.get("permanent"))
@@ -213,11 +211,11 @@ async def try_activate_key(event, user, key):
     DATA["users"][user_id] = entry
     save_data(DATA)
     if permanent:
-        await event.answer("Ключ активирован! Перманентный.")
+        await event.answer("🎉 Готово! Ключ активирован навсегда. Пользуйся на здоровье.")
     else:
         await event.answer(
-            f"Ключ активирован! {format_duration(duration)}. "
-            f"До: {format_until(now + duration)}"
+            f"✅ Ключ принят! Доступ на {format_duration(duration)}.\n"
+            f"Закончится {format_until(now + duration)}."
         )
 
 
@@ -239,12 +237,6 @@ print("Временные папки очищены")
 FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
 FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
 print(f"ffmpeg: {FFMPEG_EXE_PATH}")
-
-if COOKIES_PATH:
-    print("cookies.txt найден")
-else:
-    print("cookies.txt не найден")
-
 print(f"Owner: @{OWNER_USERNAME}")
 
 
@@ -293,57 +285,6 @@ def _download_direct(url, out_path, timeout=180):
     return out_path
 
 
-def youtube_download(url, mode):
-    print(f"YouTube mode={mode} cookies={COOKIES_PATH}")
-    opts = {
-        "outtmpl": "downloads/%(id)s.%(ext)s",
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "noplaylist": True,
-        "ffmpeg_location": FFMPEG_DIR,
-        # Пробуем несколько клиентов — web/mweb/tv. tv самый стабильный.
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "mweb", "tv"],
-            }
-        },
-    }
-    if COOKIES_PATH:
-        opts["cookiefile"] = COOKIES_PATH
-    if mode == "audio":
-        opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
-    else:
-        opts.update({
-            "format": "bestvideo*+bestaudio/best",
-            "merge_output_format": "mp4",
-        })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        fn = ydl.prepare_filename(info)
-    base, _ = os.path.splitext(fn)
-    if mode == "audio":
-        cands = [base + ".mp3", fn + ".mp3"]
-    else:
-        cands = [fn, base + ".mp4", base + ".mkv", base + ".webm"]
-    final = next((p for p in cands if os.path.exists(p)), None)
-    if not final:
-        raise FileNotFoundError(cands)
-    title = clean_meta(info.get("title") or "youtube")
-    performer = clean_meta(
-        info.get("artist") or info.get("uploader") or info.get("channel") or "",
-        max_len=64,
-    ) or "Unknown"
-    return final, title, info.get("duration"), performer, info.get("thumbnail")
-
-
 def tiktok_via_api(url, mode):
     api_url = f"https://tikwm.com/api/?url={urllib.parse.quote(url)}&hd=1"
     req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -383,6 +324,50 @@ def tiktok_via_api(url, mode):
     out = f"downloads/{vid_id}.mp4"
     _download_direct(media_url, out)
     return out, title, duration, None, None
+
+
+def other_site_download(url, mode):
+    """Скачивание через yt-dlp для всего, кроме TikTok.
+    YouTube с серверов RelaxDev не работает — IP в бане."""
+    opts = {
+        "outtmpl": "downloads/%(id)s.%(ext)s",
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "ffmpeg_location": FFMPEG_DIR,
+    }
+    if mode == "audio":
+        opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
+    else:
+        opts.update({
+            "format": "bestvideo*+bestaudio/best",
+            "merge_output_format": "mp4",
+        })
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        fn = ydl.prepare_filename(info)
+    base, _ = os.path.splitext(fn)
+    if mode == "audio":
+        cands = [base + ".mp3", fn + ".mp3"]
+    else:
+        cands = [fn, base + ".mp4", base + ".mkv", base + ".webm"]
+    final = next((p for p in cands if os.path.exists(p)), None)
+    if not final:
+        raise FileNotFoundError(cands)
+    title = clean_meta(info.get("title") or "media")
+    performer = clean_meta(
+        info.get("artist") or info.get("uploader") or info.get("channel") or "",
+        max_len=64,
+    ) or "Unknown"
+    return final, title, info.get("duration"), performer, info.get("thumbnail")
 
 
 def split_image(image_path, total_parts):
@@ -453,6 +438,10 @@ def owner_reply_kb():
     )
 
 
+# ============================================================
+#                         ХЕНДЛЕРЫ
+# ============================================================
+
 @dp.message(F.text == "/whoami")
 async def cmd_whoami(message: Message):
     u = message.from_user
@@ -466,16 +455,17 @@ async def cmd_whoami(message: Message):
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
     text = (
-        "Привет! Я умею:\n\n"
-        "Фото — разрежу на части 3×N\n"
-        "Ссылку (TikTok/YouTube/IG/FB) — скачаю видео или MP3\n"
-        "Аудиофайл — поставлю обложку, название, автора\n\n"
-        "Отправь ключ доступа одним сообщением, чтобы начать.\n"
-        "/mykey — статус ключа"
+        "👋 Привет! Я много чего умею:\n\n"
+        "📷 *Фото* — порежу на кусочки 3×N (пазл, мозаика, что угодно)\n"
+        "🎬 *TikTok* — скачаю видео или вытащу звук\n"
+        "🎵 *Аудио* — прикручу обложку, название и исполнителя\n"
+        "🔗 *Другие ссылки* (VK, Rutube и т.п.) — попробую скачать\n\n"
+        "⚠️ YouTube не поддерживаю — с сервера он не качается.\n\n"
+        "Кинь ключ доступа одним сообщением — и начнём."
     )
     if is_owner(message.from_user):
         await message.answer(
-            text + "\n\n👑 Админ-панель включена.",
+            text + "\n\n👑 *Админ-панель включена* — кнопки снизу.",
             reply_markup=owner_reply_kb(),
         )
     else:
@@ -487,16 +477,16 @@ async def cmd_mykey(message: Message):
     user_id = str(message.from_user.id)
     u = DATA["users"].get(user_id)
     if not u:
-        await message.answer("Нет активного ключа.")
+        await message.answer("У тебя пока нет активного ключа.")
         return
     if u.get("permanent"):
-        await message.answer(f"Перманентный ключ: {u.get('key')}")
+        await message.answer(f"🎫 Твой ключ: {u.get('key')}\nТип: навсегда ♾")
     else:
         exp = u.get("expires_at", 0)
         rem = max(0, exp - time.time())
         await message.answer(
-            f"Временный ключ: {u.get('key')}\n"
-            f"До: {format_until(exp)}\n"
+            f"🎫 Твой ключ: {u.get('key')}\n"
+            f"⏳ До: {format_until(exp)}\n"
             f"Осталось: {format_duration(rem)}"
         )
 
@@ -506,9 +496,9 @@ async def cmd_newkey(message: Message):
     if not is_owner(message.from_user):
         return
     b = InlineKeyboardBuilder()
-    b.button(text="Перманентный", callback_data="newkey_perm")
-    b.button(text="Временный", callback_data="newkey_temp")
-    await message.answer("Создание ключа. Выберите тип:", reply_markup=b.as_markup())
+    b.button(text="♾ Навсегда", callback_data="newkey_perm")
+    b.button(text="⏳ На время", callback_data="newkey_temp")
+    await message.answer("Какой ключ делаем?", reply_markup=b.as_markup())
 
 
 @dp.message(F.text == "/keys")
@@ -523,9 +513,9 @@ async def btn_newkey(message: Message):
     if not is_owner(message.from_user):
         return
     b = InlineKeyboardBuilder()
-    b.button(text="Перманентный", callback_data="newkey_perm")
-    b.button(text="Временный", callback_data="newkey_temp")
-    await message.answer("Создание ключа. Выберите тип:", reply_markup=b.as_markup())
+    b.button(text="♾ Навсегда", callback_data="newkey_perm")
+    b.button(text="⏳ На время", callback_data="newkey_temp")
+    await message.answer("Какой ключ делаем?", reply_markup=b.as_markup())
 
 
 @dp.message(F.text == "📋 Статусы ключей")
@@ -538,32 +528,32 @@ async def btn_keys(message: Message):
 async def _send_keys_list(message: Message):
     keys = DATA["keys"]
     if not keys:
-        await message.answer("Ключей нет.")
+        await message.answer("Пока ни одного ключа нет.")
         return
-    lines = ["Все ключи:"]
+    lines = ["🗂 *Все ключи:*\n"]
     for k, kd in keys.items():
         if kd.get("used_by"):
             u = DATA["users"].get(str(kd["used_by"]), {})
             uname = u.get("username") or "?"
             if u.get("permanent"):
-                status = "активен"
+                status = "♾ активен"
             elif u.get("expires_at", 0) > time.time():
-                status = f"до {format_until(u.get('expires_at', 0))}"
+                status = f"⏳ до {format_until(u.get('expires_at', 0))}"
             else:
-                status = "истёк"
-            lines.append(f"{k} -> @{uname} ({status})")
+                status = "❌ истёк"
+            lines.append(f"`{k}` → @{uname} ({status})")
         else:
             if kd.get("permanent"):
-                lines.append(f"{k} — перманентный свободен")
+                lines.append(f"`{k}` — ♾ свободен")
             else:
-                lines.append(f"{k} — {format_duration(kd.get('duration', 0))} свободен")
+                lines.append(f"`{k}` — ⏳ {format_duration(kd.get('duration', 0))}, свободен")
     await message.answer("\n".join(lines))
 
 
 @dp.callback_query(F.data == "newkey_perm")
 async def cb_newkey_perm(cb: CallbackQuery):
     if not is_owner(cb.from_user):
-        await cb.answer("Нет доступа", show_alert=True)
+        await cb.answer("Не твоя кнопка 🙂", show_alert=True)
         return
     key = generate_key()
     DATA["keys"][key] = {
@@ -573,17 +563,18 @@ async def cb_newkey_perm(cb: CallbackQuery):
         "used_by": None,
     }
     save_data(DATA)
-    await cb.message.edit_text(f"Перманентный ключ:\n{key}")
+    await cb.message.edit_text(f"♾ Перманентный ключ:\n`{key}`\n\nОтправь его юзеру.")
 
 
 @dp.callback_query(F.data == "newkey_temp")
 async def cb_newkey_temp(cb: CallbackQuery, state: FSMContext):
     if not is_owner(cb.from_user):
-        await cb.answer("Нет доступа", show_alert=True)
+        await cb.answer("Не твоя кнопка 🙂", show_alert=True)
         return
     await cb.message.edit_text(
-        "Введите длительность: 1d 2h 30m\n"
-        "(d — дни, h — часы, m — минуты, s — секунды)"
+        "Сколько должен жить ключ?\n"
+        "Примеры: `1d` (день), `12h` (12 часов), `1d 2h 30m`.\n"
+        "d — дни, h — часы, m — минуты, s — секунды."
     )
     await state.set_state(BotStates.waiting_for_duration)
 
@@ -595,7 +586,7 @@ async def process_duration(message: Message, state: FSMContext):
         return
     duration = parse_duration(message.text or "")
     if not duration:
-        await message.answer("Не распознано. Пример: 1d 2h 30m")
+        await message.answer("Не понял 🤔 Попробуй так: `1d 2h 30m`")
         return
     key = generate_key()
     DATA["keys"][key] = {
@@ -605,7 +596,9 @@ async def process_duration(message: Message, state: FSMContext):
         "used_by": None,
     }
     save_data(DATA)
-    await message.answer(f"Временный ключ: {key}\n{format_duration(duration)}")
+    await message.answer(
+        f"⏳ Временный ключ:\n`{key}`\nЖивёт {format_duration(duration)}."
+    )
     await state.clear()
 
 
@@ -620,8 +613,12 @@ async def cmd_cancel(message: Message, state: FSMContext):
             except Exception:
                 pass
     await state.clear()
-    await message.answer("Отменено.")
+    await message.answer("Ок, отменил 👌")
 
+
+# ============================================================
+#                      РАБОТА С МЕДИА
+# ============================================================
 
 @dp.message(F.audio)
 async def process_audio_for_tag(message: Message, state: FSMContext):
@@ -640,7 +637,7 @@ async def process_audio_for_tag(message: Message, state: FSMContext):
     await bot.download_file(fi.file_path, lp)
     await state.update_data(audio_path=lp)
     await state.set_state(BotStates.waiting_for_cover)
-    await message.answer("Пришли картинку звука (обложку).")
+    await message.answer("🎨 Кидай обложку — картинку для этого трека.")
 
 
 @dp.message(BotStates.waiting_for_cover, F.photo)
@@ -651,23 +648,26 @@ async def process_cover(message: Message, state: FSMContext):
     await bot.download_file(fi.file_path, cp)
     await state.update_data(cover_path=cp)
     await state.set_state(BotStates.waiting_for_meta)
-    await message.answer("Пришли название и автора через | :\nНазвание | Исполнитель")
+    await message.answer(
+        "✍️ Теперь название и исполнитель через палочку:\n"
+        "`Название | Исполнитель`"
+    )
 
 
 @dp.message(BotStates.waiting_for_cover)
 async def wrong_cover(message: Message):
-    await message.answer("Нужна именно картинка.")
+    await message.answer("Хм, нужна именно картинка 📷")
 
 
 @dp.message(BotStates.waiting_for_meta)
 async def process_meta(message: Message, state: FSMContext):
     t = (message.text or "").strip()
     if "|" not in t:
-        await message.answer("Формат: Название | Исполнитель")
+        await message.answer("Формат такой: `Название | Исполнитель`")
         return
     title, performer = [x.strip() for x in t.split("|", 1)]
     if not title:
-        await message.answer("Название пустое.")
+        await message.answer("Название-то пустое 🤷")
         return
     if not performer:
         performer = "Unknown"
@@ -675,10 +675,10 @@ async def process_meta(message: Message, state: FSMContext):
     ap = data.get("audio_path")
     cp = data.get("cover_path")
     if not ap or not os.path.exists(ap):
-        await message.answer("Аудио не найдено.")
+        await message.answer("Куда-то пропало аудио. Давай заново.")
         await state.clear()
         return
-    status = await message.answer("Ставлю метки...")
+    status = await message.answer("🎧 Колдую над метками...")
     out = None
     try:
         loop = asyncio.get_event_loop()
@@ -688,7 +688,7 @@ async def process_meta(message: Message, state: FSMContext):
             "audio": FSInputFile(out, filename=f"{title}.mp3"),
             "title": title,
             "performer": performer,
-            "caption": "Метки установлены!",
+            "caption": "✨ Готово! Забирай.",
         }
         if dur:
             kw["duration"] = int(dur)
@@ -699,9 +699,9 @@ async def process_meta(message: Message, state: FSMContext):
     except Exception as e:
         err = str(e)[:300]
         try:
-            await status.edit_text(f"Ошибка: {err}")
+            await status.edit_text(f"Ой, что-то сломалось: {err}")
         except Exception:
-            await message.answer(f"Ошибка: {err}")
+            await message.answer(f"Ой, что-то сломалось: {err}")
     finally:
         for p in (ap, cp, out):
             if p and os.path.exists(p):
@@ -714,7 +714,7 @@ async def process_meta(message: Message, state: FSMContext):
 
 @dp.message(F.voice | F.video_note)
 async def reject_voice(message: Message):
-    await message.answer("ГС и видеокружки не поддерживаются.")
+    await message.answer("Голосовые и кружки не прокачаны пока 🙈")
 
 
 @dp.message(F.photo)
@@ -726,10 +726,12 @@ async def process_photo(message: Message, state: FSMContext):
     await state.update_data(photo_path=lp)
     await state.set_state(BotStates.waiting_for_parts)
     b = InlineKeyboardBuilder()
-    b.button(text="Готово (Авто)", callback_data="auto_split")
+    b.button(text="🎲 На твоё усмотрение", callback_data="auto_split")
     await message.answer(
-        "На сколько частей? Число кратное 3, или авто.",
-        reply_markup=b.as_markup()
+        "✂️ На сколько кусочков резать?\n"
+        "Число должно делиться на 3 (например, 6, 9, 12).\n"
+        "Или жми кнопку — сам прикину.",
+        reply_markup=b.as_markup(),
     )
 
 
@@ -738,13 +740,13 @@ async def auto_split(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     pp = d.get("photo_path")
     if not pp or not os.path.exists(pp):
-        await cb.answer("Файл не найден", show_alert=True)
+        await cb.answer("Файл потерялся", show_alert=True)
         await state.clear()
         return
     await cb.message.edit_reply_markup(reply_markup=None)
     loop = asyncio.get_event_loop()
     n = await loop.run_in_executor(None, calculate_auto_parts, pp)
-    await cb.message.answer(f"Авто: {n} частей.")
+    await cb.message.answer(f"🤔 Прикинул: {n} кусочков.")
     await execute_splitting(cb.message, state, pp, n)
     await cb.answer()
 
@@ -752,18 +754,18 @@ async def auto_split(cb: CallbackQuery, state: FSMContext):
 @dp.message(BotStates.waiting_for_parts)
 async def process_parts(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
-        await message.answer("Число цифрами.")
+        await message.answer("Нужно число цифрами 🙂")
         return
     n = int(message.text)
     if n < 3 or n % 3 != 0:
-        await message.answer("Кратно 3.")
+        await message.answer("Число должно делиться на 3. Попробуй ещё раз.")
         return
     d = await state.get_data()
     await execute_splitting(message, state, d.get("photo_path"), n)
 
 
 async def execute_splitting(msg_obj, state, pp, n):
-    st = await msg_obj.answer("Нарезаю...")
+    st = await msg_obj.answer("🔪 Режу...")
     try:
         loop = asyncio.get_event_loop()
         parts = await loop.run_in_executor(None, split_image, pp, n)
@@ -772,9 +774,9 @@ async def execute_splitting(msg_obj, state, pp, n):
                 await msg_obj.answer_photo(FSInputFile(pf))
                 os.remove(pf)
         await st.delete()
-        await msg_obj.answer("Готово!")
+        await msg_obj.answer("✨ Готово! Держи свои кусочки.")
     except Exception as e:
-        await msg_obj.answer(f"Ошибка: {e}")
+        await msg_obj.answer(f"Что-то пошло не так: {e}")
     finally:
         if os.path.exists(pp):
             os.remove(pp)
@@ -784,12 +786,18 @@ async def execute_splitting(msg_obj, state, pp, n):
 @dp.message(F.text.contains("http://") | F.text.contains("https://"))
 async def ask_type(message: Message, state: FSMContext):
     url = message.text.strip()
+    if "youtube.com" in url or "youtu.be" in url:
+        await message.answer(
+            "😔 С YouTube я не могу качать — сервер блокируется.\n"
+            "Попробуй TikTok или другую ссылку."
+        )
+        return
     await state.update_data(download_url=url)
     await state.set_state(BotStates.waiting_for_media_type)
     b = InlineKeyboardBuilder()
-    b.button(text="Аудио (MP3)", callback_data="get_audio")
-    b.button(text="Видео (MP4)", callback_data="get_video")
-    await message.answer("Что скачать?", reply_markup=b.as_markup())
+    b.button(text="🎵 Только звук (MP3)", callback_data="get_audio")
+    b.button(text="🎬 Видео (MP4)", callback_data="get_video")
+    await message.answer("Что вытащить из ссылки?", reply_markup=b.as_markup())
 
 
 @dp.callback_query(F.data.in_({"get_audio", "get_video"}), BotStates.waiting_for_media_type)
@@ -798,52 +806,30 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
     url = d.get("download_url")
     mode = cb.data
     await cb.message.edit_reply_markup(reply_markup=None)
-    status = await cb.message.answer("Подключаюсь...")
+    status = await cb.message.answer("⏳ Секунду, качаю...")
     await cb.answer()
 
     loop = asyncio.get_event_loop()
     is_tiktok = "tiktok.com" in url or "vm.tiktok.com" in url or "vt.tiktok.com" in url
-    is_youtube = "youtube.com" in url or "youtu.be" in url
 
     fn = None
     tp = None
     try:
         if is_tiktok:
             try:
-                await status.edit_text("Скачиваю TikTok...")
+                await status.edit_text("⏳ Тяну с TikTok...")
             except Exception:
                 pass
             fn, title, dur, _, _ = await loop.run_in_executor(None, tiktok_via_api, url, mode)
-            if not os.path.exists(fn):
-                raise FileNotFoundError(fn)
-            if mode == "get_audio":
-                kw = {
-                    "audio": FSInputFile(fn, filename=f"{title}.mp3"),
-                    "title": title,
-                    "caption": "Звук готов!",
-                }
-                if dur:
-                    kw["duration"] = int(dur)
-                await cb.message.answer_audio(**kw)
-            else:
-                await cb.message.answer_video(
-                    video=FSInputFile(fn, filename=f"{title}.mp4"),
-                    caption="Готово!",
-                    duration=int(dur) if dur else None,
-                )
-            await status.delete()
-            return
-
-        if is_youtube:
+        else:
             try:
-                await status.edit_text("Скачиваю YouTube...")
+                await status.edit_text("⏳ Пробую скачать...")
             except Exception:
                 pass
             fn, title, dur, performer, thumb_url = await loop.run_in_executor(
-                None, youtube_download, url, mode
+                None, other_site_download, url, mode
             )
-            if not os.path.exists(fn):
-                raise FileNotFoundError(fn)
+            # пробуем превью
             if thumb_url and mode == "get_audio":
                 try:
                     tp = f"downloads/thumb_{abs(hash(url)) % 10**8}.jpg"
@@ -861,93 +847,15 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
                 except Exception as te:
                     print(f"thumb: {te}")
                     tp = None
-            if mode == "get_audio":
-                kw = {
-                    "audio": FSInputFile(fn, filename=f"{title}.mp3"),
-                    "title": title,
-                    "caption": "Звук готов!",
-                }
-                if dur:
-                    kw["duration"] = int(dur)
-                if performer and performer != "Unknown":
-                    kw["performer"] = performer
-                if tp and os.path.exists(tp):
-                    kw["thumbnail"] = FSInputFile(tp)
-                await cb.message.answer_audio(**kw)
-            else:
-                await cb.message.answer_video(
-                    video=FSInputFile(fn, filename=f"{title}.mp4"),
-                    caption="Готово!",
-                    duration=int(dur) if dur else None,
-                )
-            await status.delete()
-            return
 
-        opts = {
-            "outtmpl": "downloads/%(id)s.%(ext)s",
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-            "noplaylist": True,
-            "ffmpeg_location": FFMPEG_DIR,
-        }
-        if COOKIES_PATH:
-            opts["cookiefile"] = COOKIES_PATH
+        if not fn or not os.path.exists(fn):
+            raise FileNotFoundError("файл не скачался")
+
         if mode == "get_audio":
-            opts.update({
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
-            })
-        else:
-            opts.update({
-                "format": "bestvideo*+bestaudio/best",
-                "merge_output_format": "mp4",
-            })
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = await loop.run_in_executor(
-                None, lambda: ydl.extract_info(url, download=True)
-            )
-            fname = ydl.prepare_filename(info)
-        base, _ = os.path.splitext(fname)
-        if mode == "get_audio":
-            cands = [base + ".mp3", fname + ".mp3"]
-        else:
-            cands = [fname, base + ".mp4", base + ".mkv", base + ".webm"]
-        fn = next((p for p in cands if os.path.exists(p)), None)
-        if not fn:
-            raise FileNotFoundError(cands)
-        dur = info.get("duration")
-        title = clean_meta(info.get("title") or "media")
-        performer = clean_meta(
-            info.get("artist") or info.get("uploader") or "", max_len=64
-        ) or "Unknown"
-        if mode == "get_audio":
-            thumb_url = info.get("thumbnail")
-            if thumb_url:
-                try:
-                    tp = f"downloads/{info['id']}_t.jpg"
-                    req = urllib.request.Request(
-                        thumb_url, headers={"User-Agent": "Mozilla/5.0"}
-                    )
-                    with urllib.request.urlopen(req, timeout=15) as r:
-                        data = r.read()
-                    raw = tp + ".raw"
-                    with open(raw, "wb") as f:
-                        f.write(data)
-                    img = Image.open(raw).convert("RGB")
-                    img.save(tp, "JPEG", quality=90)
-                    os.remove(raw)
-                except Exception:
-                    tp = None
             kw = {
                 "audio": FSInputFile(fn, filename=f"{title}.mp3"),
                 "title": title,
-                "performer": performer,
-                "caption": "Готово!",
+                "caption": "🎵 Готово, забирай звук!",
             }
             if dur:
                 kw["duration"] = int(dur)
@@ -957,7 +865,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
         else:
             await cb.message.answer_video(
                 video=FSInputFile(fn, filename=f"{title}.mp4"),
-                caption="Готово!",
+                caption="🎬 Готово, приятного просмотра!",
                 duration=int(dur) if dur else None,
             )
         await status.delete()
@@ -966,9 +874,9 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
         print(f"err: {e}")
         err = str(e)[:300]
         try:
-            await status.edit_text(f"Не удалось скачать. {err}")
+            await status.edit_text(f"😔 Не получилось скачать.\n{err}")
         except Exception:
-            await cb.message.answer(f"Не удалось скачать. {err}")
+            await cb.message.answer(f"😔 Не получилось скачать.\n{err}")
     finally:
         for p in (fn, tp):
             if p and os.path.exists(p):
