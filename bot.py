@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import json
 import time
 import asyncio
@@ -16,7 +15,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    BufferedInputFile, InputSticker,
+    BufferedInputFile, InputSticker, BotCommand,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -54,13 +53,10 @@ class BotStates(StatesGroup):
     waiting_for_cover = State()
     waiting_for_meta = State()
     waiting_for_duration = State()
-    # TTS
     waiting_tts_text = State()
-    # Stickers
     waiting_sticker_name = State()
     waiting_sticker_title = State()
     waiting_sticker_first = State()
-    waiting_sticker_emoji = State()
     waiting_sticker_add_photo = State()
 
 
@@ -105,11 +101,10 @@ def load_data():
                 d.setdefault("keys", {})
                 d.setdefault("users", {})
                 d.setdefault("sticker_packs", {})
-                d.setdefault("tts_usage", {})
                 return d
         except Exception as e:
             print(f"load_data: {e}")
-    return {"keys": {}, "users": {}, "sticker_packs": {}, "tts_usage": {}}
+    return {"keys": {}, "users": {}, "sticker_packs": {}}
 
 
 def save_data(data):
@@ -491,21 +486,6 @@ def owner_reply_kb():
     )
 
 
-def user_reply_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🎙 Озвучить текст"),
-             KeyboardButton(text="🎨 Стикерпаки")],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
-# ============================================================
-#                       TTS
-# ============================================================
-
 async def run_tts(text: str, voice: str, out_path: str):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(out_path)
@@ -520,9 +500,15 @@ def tts_voice_kb():
     return b.as_markup()
 
 
-# ============================================================
-#                     STICKER HELPERS
-# ============================================================
+def convert_to_ogg(mp3_path: str, ogg_path: str):
+    cmd = [FFMPEG_EXE_PATH, "-y", "-i", mp3_path,
+           "-c:a", "libopus", "-b:a", "64k", ogg_path]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="ignore")
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[-300:] if r.stderr else "ogg convert err")
+    return ogg_path
+
 
 def photo_to_webp_sticker(src_path: str, dst_path: str):
     img = Image.open(src_path).convert("RGBA")
@@ -561,9 +547,9 @@ async def cmd_start(message: Message):
         "📷 Фото — режу на части 3×N\n"
         "🎬 TikTok — качаю видео или вытаскиваю звук\n"
         "🎵 Аудио — ставлю обложку, название, исполнителя\n"
-        "🎙 Озвучка — текст превращаю в аудио\n"
+        "🎙 Озвучка — текст превращаю в голос\n"
         "🎨 Стикерпаки — собираю твои стикеры\n"
-        "🤫 Шёпот — в чате напиши `@" + bot_uname + " текст @username`\n\n"
+        f"🤫 Шёпот — в чате напиши `@{bot_uname} текст @username`\n\n"
         "🔑 Отправь /code ТВОЙ_КЛЮЧ, чтобы начать."
     )
     if is_owner(message.from_user):
@@ -580,10 +566,13 @@ async def cmd_start(message: Message):
 async def cmd_help(message: Message):
     bot_uname = await get_bot_username()
     await message.answer(
-        "📖 *Команды:*\n\n"
-        "/tts — озвучить текст\n"
-        "/stickers — стикерпаки\n"
-        f"/whisper — как работает шёпот\n\n"
+        "📖 *Что умею:*\n\n"
+        "🎙 `/tts` — озвучить текст\n"
+        "🎨 `/stickers` — стикерпаки\n"
+        "🤫 `/whisper` — как отправить шёпот\n\n"
+        "📷 *Фото* — режу на 3×N\n"
+        "🎬 *TikTok-ссылка* — видео или MP3\n"
+        "🎵 *Аудиофайл* — обложка и теги\n\n"
         f"🤫 *Шёпот в чате:* `@{bot_uname} текст @username`",
         parse_mode="Markdown",
     )
@@ -620,8 +609,6 @@ async def cmd_mykey(message: Message):
             f"⏳ Осталось: {format_duration(rem)}"
         )
 
-
-# --- ADMIN ---
 
 @dp.message(F.text == "/newkey")
 async def cmd_newkey(message: Message):
@@ -752,13 +739,9 @@ async def cmd_cancel(message: Message, state: FSMContext):
 # ============================================================
 
 @dp.message(F.text == "/tts")
-@dp.message(F.text == "🎙 Озвучить текст")
 async def cmd_tts(message: Message, state: FSMContext):
     await state.set_state(None)
-    await message.answer(
-        "🎙 Выбери голос:",
-        reply_markup=tts_voice_kb(),
-    )
+    await message.answer("🎙 Выбери голос:", reply_markup=tts_voice_kb())
 
 
 @dp.callback_query(F.data.startswith("tts_voice:"))
@@ -790,14 +773,19 @@ async def process_tts_text(message: Message, state: FSMContext):
     voice_id, voice_label = TTS_VOICES[voice_key]
 
     status = await message.answer("🎙 Генерирую...")
-    out = f"downloads/tts_{message.from_user.id}_{int(time.time())}.mp3"
+    mp3_path = f"downloads/tts_{message.from_user.id}_{int(time.time())}.mp3"
+    ogg_path = f"downloads/tts_{message.from_user.id}_{int(time.time())}.ogg"
     try:
-        await run_tts(text, voice_id, out)
-        if not os.path.exists(out) or os.path.getsize(out) < 100:
-            raise RuntimeError("пустой файл")
-        dur = await asyncio.get_event_loop().run_in_executor(None, get_duration, out)
+        await run_tts(text, voice_id, mp3_path)
+        if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) < 100:
+            raise RuntimeError("пустой файл от edge-tts")
+
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, convert_to_ogg, mp3_path, ogg_path)
+        dur = await loop.run_in_executor(None, get_duration, ogg_path)
+
         kw = {
-            "audio": FSInputFile(out, filename="voice.mp3"),
+            "voice": FSInputFile(ogg_path, filename="voice.ogg"),
             "caption": f"🎙 Голос: {voice_label}",
         }
         if dur:
@@ -811,11 +799,12 @@ async def process_tts_text(message: Message, state: FSMContext):
         except Exception:
             await message.answer(f"😔 Не получилось озвучить:\n{err}")
     finally:
-        if os.path.exists(out):
-            try:
-                os.remove(out)
-            except Exception:
-                pass
+        for p in (mp3_path, ogg_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
         await state.clear()
 
 
@@ -955,7 +944,28 @@ async def cb_whisper(cb: CallbackQuery):
     if (cb.from_user.username or "").lower() == w["target_name"].lower():
         is_target = True
 
-    if is_target:
+    is_sender = cb.from_user.id == w["from_id"]
+
+    if is_sender:
+        txt = w["text"]
+        if len(txt) <= 180:
+            await cb.answer(
+                f"📤 Это твой шёпот для @{w['target_name']}.\n\nТекст: {txt}",
+                show_alert=True,
+            )
+        else:
+            try:
+                await bot.send_message(
+                    cb.from_user.id,
+                    f"📤 Твой шёпот для @{w['target_name']}:\n\n{txt}",
+                )
+                await cb.answer("📩 Отправил тебе в личку.", show_alert=True)
+            except Exception:
+                await cb.answer(
+                    f"📤 Твой шёпот для @{w['target_name']}.\n\nТекст: {txt[:180]}...",
+                    show_alert=True,
+                )
+    elif is_target:
         txt = w["text"]
         if len(txt) <= 180:
             await cb.answer(f"🤫 {txt}", show_alert=True)
@@ -989,7 +999,6 @@ async def cb_whisper_help(cb: CallbackQuery):
 # ============================================================
 
 @dp.message(F.text == "/stickers")
-@dp.message(F.text == "🎨 Стикерпаки")
 async def cmd_stickers(message: Message, state: FSMContext):
     await state.set_state(None)
     b = InlineKeyboardBuilder()
@@ -998,9 +1007,9 @@ async def cmd_stickers(message: Message, state: FSMContext):
     b.button(text="📂 Мои паки", callback_data="st_list")
     b.adjust(1)
     await message.answer(
-        "🎨 Стикерпаки.\n\n"
-        "Создай свой пак — и добавляй туда стикеры из фото.\n"
-        "В описании пака будет метка «создано этим ботом».",
+        "🎨 *Стикерпаки*\n\n"
+        "Создай свой пак и добавляй туда стикеры из фото.\n"
+        "В имени пака будет метка бота.",
         reply_markup=b.as_markup(),
     )
 
@@ -1009,8 +1018,9 @@ async def cmd_stickers(message: Message, state: FSMContext):
 async def cb_st_create(cb: CallbackQuery, state: FSMContext):
     bot_uname = await get_bot_username()
     await cb.message.edit_text(
-        "📝 Придумай короткое имя для пака (латиница, цифры, `_`).\n"
-        f"В Telegram он будет выглядеть как `имя_by_{bot_uname}`.\n\n"
+        "📝 Придумай короткое имя для пака.\n"
+        "Только латиница, цифры, `_`. Начинается с буквы.\n"
+        f"В Telegram пак будет: `имя_by_{bot_uname}`.\n\n"
         "Пример: `mycats`"
     )
     await state.set_state(BotStates.waiting_sticker_name)
@@ -1033,7 +1043,7 @@ async def process_sticker_name(message: Message, state: FSMContext):
     await state.update_data(sticker_short=short, sticker_full=full_name)
     await state.set_state(BotStates.waiting_sticker_title)
     await message.answer(
-        f"📛 Теперь название пака (то, что видно в списке).\n"
+        f"📛 Теперь название пака (видно в списке).\n"
         f"Пример: `Мои котики`"
     )
 
@@ -1048,7 +1058,7 @@ async def process_sticker_title(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_sticker_first)
     await message.answer(
         "🖼 Теперь пришли первую картинку для стикера.\n"
-        "Из неё сделаю стикер 512×512."
+        "Сделаю из неё стикер 512×512."
     )
 
 
@@ -1076,31 +1086,20 @@ async def process_sticker_first(message: Message, state: FSMContext):
             raise RuntimeError("не удалось создать webp")
         with open(dst, "rb") as f:
             sticker_bytes = f.read()
+        print(f"sticker size: {len(sticker_bytes)} bytes")
         if len(sticker_bytes) > 512 * 1024:
             raise RuntimeError("стикер больше 512 КБ")
 
-        try:
-            await bot.create_new_sticker_set(
-                user_id=message.from_user.id,
-                name=full_name,
-                title=title,
-                stickers=[InputSticker(
-                    sticker=BufferedInputFile(sticker_bytes, filename="sticker.webp"),
-                    format="static",
-                    emoji_list=["😀"],
-                )],
-            )
-        except Exception as e:
-            err = str(e)
-            if "PeerIdInvalid" in err or "user not found" in err.lower():
-                await status.edit_text(
-                    "⚠️ Telegram не даёт создать пак.\n\n"
-                    "Напиши боту в личку /start (уже сделано?) и попробуй снова.\n"
-                    "Также проверь — может, имя пака занято."
-                )
-                await state.clear()
-                return
-            raise
+        await bot.create_new_sticker_set(
+            user_id=message.from_user.id,
+            name=full_name,
+            title=title,
+            stickers=[InputSticker(
+                sticker=BufferedInputFile(sticker_bytes, filename="sticker.webp"),
+                format="static",
+                emoji_list=["😀"],
+            )],
+        )
 
         user_id = str(message.from_user.id)
         packs = DATA["sticker_packs"].setdefault(user_id, [])
@@ -1115,10 +1114,11 @@ async def process_sticker_first(message: Message, state: FSMContext):
             f"✅ Пак создан!\n\n"
             f"📛 {title}\n"
             f"🔗 https://t.me/addstickers/{full_name}\n\n"
-            f"Теперь можешь кидать фото сюда и добавлять их в этот пак."
+            f"Теперь можешь добавлять туда стикеры: /stickers → Добавить."
         )
     except Exception as e:
-        err = str(e)[:300]
+        err = str(e)[:400]
+        print(f"sticker err: {err}")
         try:
             await status.edit_text(f"❌ Ошибка:\n{err}")
         except Exception:
@@ -1344,7 +1344,7 @@ async def process_meta(message: Message, state: FSMContext):
 
 @dp.message(F.voice | F.video_note)
 async def reject_voice(message: Message):
-    await message.answer("🙈 Голосовые и кружки не поддерживаю.")
+    await message.answer("🙈 Голосовые и кружки пока не расшифровываю.")
 
 
 @dp.message(F.photo)
@@ -1526,11 +1526,31 @@ async def keep_alive():
             print(f"keep-alive: {e}")
 
 
+async def set_bot_commands():
+    """Устанавливает меню команд в Telegram."""
+    commands = [
+        BotCommand(command="start", description="Начать работу"),
+        BotCommand(command="help", description="Помощь"),
+        BotCommand(command="code", description="Активировать ключ"),
+        BotCommand(command="mykey", description="Мой ключ"),
+        BotCommand(command="tts", description="Озвучить текст"),
+        BotCommand(command="stickers", description="Стикерпаки"),
+        BotCommand(command="whisper", description="Как отправить шёпот"),
+        BotCommand(command="cancel", description="Отменить действие"),
+    ]
+    try:
+        await bot.set_my_commands(commands)
+        print("Команды установлены")
+    except Exception as e:
+        print(f"set_my_commands err: {e}")
+
+
 dp.message.middleware(AccessMiddleware())
 
 
 async def main():
     print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}")
+    await set_bot_commands()
     print("Bot started")
     asyncio.create_task(keep_alive())
     await dp.start_polling(bot)
