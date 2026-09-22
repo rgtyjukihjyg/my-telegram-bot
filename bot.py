@@ -299,6 +299,13 @@ def youtube_download(url, mode):
         "noprogress": True,
         "noplaylist": True,
         "ffmpeg_location": FFMPEG_DIR,
+        # ПО ТОКЕН + мобильный клиент для обхода проверок YouTube
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["mweb"],
+                "youtubepot-bgutilscript": {},
+            }
+        },
     }
     if COOKIES_PATH:
         opts["cookiefile"] = COOKIES_PATH
