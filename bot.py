@@ -16,7 +16,7 @@ from aiogram.types import (
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
     InlineKeyboardMarkup, InlineKeyboardButton,
     BufferedInputFile, InputSticker, BotCommand,
-    MenuButtonCommands,
+    MenuButtonCommands, InputMediaPhoto,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -308,12 +308,23 @@ class AccessMiddleware(BaseMiddleware):
         if status == "expired":
             DATA["users"].pop(str(user.id), None)
             save_data(DATA)
-            await event.answer("⏰ Срок действия ключа истёк. Введи новый через /code.")
+            try:
+                await event.answer("⏰ Срок действия ключа истёк. Введи новый через /code.")
+            except Exception as e:
+                print(f"expired send err: {e}")
             return
-        await event.answer(
-            "🔒 Доступ только по ключу.\n"
-            "Отправь: /code ТВОЙ_КЛЮЧ"
-        )
+
+        print(f"BLOCKED user={user.id} @{user.username} text={text[:50]!r} type={event.content_type}")
+        try:
+            await event.answer(
+                "🔒 Доступ только по ключу.\n\n"
+                "1. Получи ключ у @vimbrix\n"
+                "2. Отправь: /code ТВОЙ_КЛЮЧ\n\n"
+                "Если уже активировал — /mykey покажет статус."
+            )
+            print(f"BLOCKED: ответ ушёл юзеру {user.id}")
+        except Exception as e:
+            print(f"BLOCKED send err: {e}")
 
 
 async def try_activate_key(event, user, key):
@@ -587,7 +598,6 @@ def get_stt_model():
     if STT_MODEL is None:
         print("Загружаю модель распознавания (первый раз долго)...")
         from faster_whisper import WhisperModel
-        # base — золотая середина: точнее tiny, быстрее small
         STT_MODEL = WhisperModel("base", device="cpu", compute_type="int8")
         print("Модель STT загружена")
     return STT_MODEL
@@ -1127,6 +1137,21 @@ async def process_sticker_title(message: Message, state: FSMContext):
     )
 
 
+def photo_to_webp_sticker(src_path: str, dst_path: str):
+    img = Image.open(src_path).convert("RGBA")
+    w, h = img.size
+    side = max(w, h)
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(img, ((side - w) // 2, (side - h) // 2))
+    canvas = canvas.resize((512, 512), Image.LANCZOS)
+    canvas.save(dst_path, "WEBP", quality=95, method=6)
+    return dst_path
+
+
+def validate_pack_shortname(name: str) -> bool:
+    return bool(re.match(r"^[a-zA-Z][a-zA-Z0-9_]{0,50}$", name))
+
+
 @dp.message(BotStates.waiting_sticker_first, F.photo)
 async def process_sticker_first(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -1454,14 +1479,57 @@ async def execute_splitting(msg_obj, state, pp, n):
     try:
         loop = asyncio.get_event_loop()
         parts = await loop.run_in_executor(None, split_image, pp, n)
+
+        # ЧИСЛОВАЯ сортировка: (row, col) — построчно, слева-направо.
+        # part_0_0 → part_0_1 → part_0_2 → part_1_0 → part_1_1 → ...
+        # Это правильный порядок: 1=левый верх, 2=центр верх, 3=правый верх,
+        # 4=левый второй ряд, 5=центр второй ряд, и т.д.
+        def sort_key(path):
+            m = re.search(r'part_(\d+)_(\d+)', path)
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+            return (999, 999)
+
+        parts = sorted(parts, key=sort_key)
+        total = len(parts)
+        print(f"split: {total} частей, порядок: {[os.path.basename(p) for p in parts[:6]]}...")
+
+        # Отправляем альбомами по 10 — порядок внутри альбома сохраняется
+        chunk_size = 10
+        for i in range(0, total, chunk_size):
+            group = parts[i:i + chunk_size]
+            media = []
+            for j, pf in enumerate(group):
+                if os.path.exists(pf):
+                    idx = i + j + 1
+                    media.append(InputMediaPhoto(
+                        media=FSInputFile(pf),
+                        caption=f"{idx}/{total}",
+                    ))
+            if not media:
+                continue
+            if len(media) == 1:
+                await msg_obj.answer_photo(media[0].media, caption=media[0].caption)
+            else:
+                await msg_obj.answer_media_group(media)
+            await asyncio.sleep(0.6)
+
+        # Удаляем временные файлы
         for pf in parts:
             if os.path.exists(pf):
-                await msg_obj.answer_photo(FSInputFile(pf))
-                os.remove(pf)
+                try:
+                    os.remove(pf)
+                except Exception:
+                    pass
+
         await st.delete()
-        await msg_obj.answer("✅ Готово! Держи свои кусочки.")
+        await msg_obj.answer(
+            f"✅ Готово! {total} кусочков.\n"
+            f"Порядок: слева-направо, сверху-вниз (1/{total} → {total}/{total})."
+        )
     except Exception as e:
-        await msg_obj.answer(f"❌ Что-то пошло не так: {e}")
+        print(f"split err: {e}")
+        await msg_obj.answer(f"❌ Ошибка: {e}")
     finally:
         if os.path.exists(pp):
             os.remove(pp)
