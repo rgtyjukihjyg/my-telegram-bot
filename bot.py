@@ -86,10 +86,6 @@ FUNNY_REPLIES = [
 ]
 
 
-# ============================================================
-#                   ХРАНИЛИЩЕ (ФАЙЛ + TELEGRAM)
-# ============================================================
-
 def _empty_data():
     return {"keys": {}, "users": {}, "sticker_packs": {}}
 
@@ -583,7 +579,7 @@ def owner_reply_kb():
 
 
 # ============================================================
-#              STT — АУДИО/ВИДЕО В ТЕКСТ (faster-whisper)
+#              STT — АУДИО/ВИДЕО В ТЕКСТ
 # ============================================================
 
 def get_stt_model():
@@ -591,7 +587,8 @@ def get_stt_model():
     if STT_MODEL is None:
         print("Загружаю модель распознавания (первый раз долго)...")
         from faster_whisper import WhisperModel
-        STT_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
+        # base — золотая середина: точнее tiny, быстрее small
+        STT_MODEL = WhisperModel("base", device="cpu", compute_type="int8")
         print("Модель STT загружена")
     return STT_MODEL
 
@@ -608,7 +605,13 @@ def convert_to_wav(src_path: str, wav_path: str):
 
 def transcribe_wav(wav_path: str):
     model = get_stt_model()
-    segments, info = model.transcribe(wav_path, beam_size=1, vad_filter=True)
+    segments, info = model.transcribe(
+        wav_path,
+        language="ru",
+        beam_size=5,
+        vad_filter=True,
+        initial_prompt="Голосовое сообщение на русском языке.",
+    )
     text = " ".join(s.text.strip() for s in segments).strip()
     return text, info.language
 
@@ -632,9 +635,7 @@ async def _handle_stt(message: Message, file_id: str, ext_hint: str = ".ogg"):
             await status.edit_text("🤷 Не разобрал ни слова. Может, тихо записано?")
         else:
             preview = text if len(text) <= 3900 else text[:3900] + "..."
-            await status.edit_text(
-                f"📝 Расшифровка (язык: {lang}):\n\n{preview}"
-            )
+            await status.edit_text(f"📝 Расшифровка:\n\n{preview}")
     except Exception as e:
         err = str(e)[:300]
         print(f"stt err: {err}")
@@ -868,8 +869,6 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await message.answer("👌 Отменил.")
 
 
-# --- STT: голосовое и видеокружок ---
-
 @dp.message(F.voice)
 async def process_voice(message: Message, state: FSMContext):
     await state.set_state(None)
@@ -881,8 +880,6 @@ async def process_video_note(message: Message, state: FSMContext):
     await state.set_state(None)
     await _handle_stt(message, message.video_note.file_id, ".mp4")
 
-
-# --- Whisper inline ---
 
 @dp.message(F.text == "/whisper")
 async def cmd_whisper(message: Message):
@@ -1065,8 +1062,6 @@ async def cb_whisper_help(cb: CallbackQuery):
         show_alert=True,
     )
 
-
-# --- Стикерпаки ---
 
 @dp.message(F.text == "/stickers")
 async def cmd_stickers(message: Message, state: FSMContext):
@@ -1314,8 +1309,6 @@ async def process_sticker_add(message: Message, state: FSMContext):
 async def wrong_sticker_add(message: Message):
     await message.answer("🖼 Нужна именно картинка.")
 
-
-# --- Медиа ---
 
 @dp.message(F.audio)
 async def process_audio_for_tag(message: Message, state: FSMContext):
@@ -1630,7 +1623,6 @@ async def main():
     print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}")
     await set_bot_commands()
     await set_bot_menu()
-    # STT грузим в фоне, чтобы не тормозить старт
     asyncio.create_task(preload_stt())
     print("Bot started")
     asyncio.create_task(keep_alive())
