@@ -299,7 +299,7 @@ def youtube_download(url, mode):
         "noprogress": True,
         "noplaylist": True,
         "ffmpeg_location": FFMPEG_DIR,
-        # ПО ТОКЕН + мобильный клиент для обхода проверок YouTube
+        # PO Token + мобильный клиент для обхода проверок YouTube
         "extractor_args": {
             "youtube": {
                 "player_client": ["mweb"],
@@ -319,8 +319,11 @@ def youtube_download(url, mode):
             }],
         })
     else:
+        # Универсальный селектор: лучший видеопоток + лучший аудио.
+        # Без жёсткого ограничения filesize — YouTube часто не отдаёт размер,
+        # из-за чего формат "не находится".
         opts.update({
-            "format": "best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best",
+            "format": "bestvideo*+bestaudio/best",
             "merge_output_format": "mp4",
         })
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -864,7 +867,7 @@ async def process_download(cb: CallbackQuery, state: FSMContext):
             })
         else:
             opts.update({
-                "format": "best[filesize<45M]/bestvideo[filesize<45M]+bestaudio/best",
+                "format": "bestvideo*+bestaudio/best",
                 "merge_output_format": "mp4",
             })
         with yt_dlp.YoutubeDL(opts) as ydl:
