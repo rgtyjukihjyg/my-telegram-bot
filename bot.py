@@ -8,7 +8,10 @@ import urllib.request
 import urllib.parse
 import subprocess
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.types import Message, FSInputFile, CallbackQuery
+from aiogram.types import (
+    Message, FSInputFile, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
@@ -21,11 +24,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("нет BOT_TOKEN")
 
-# Твой Telegram ID — жёстко прописан для надёжности
 OWNER_ID = 7752398574
 OWNER_USERNAME = (os.environ.get("OWNER_USERNAME") or "vimbrix").lower().lstrip("@")
 
-# Если хочешь переопределить через env (необязательно):
 _env_id = os.environ.get("OWNER_ID")
 if _env_id and _env_id.strip().isdigit():
     OWNER_ID = int(_env_id)
@@ -147,7 +148,8 @@ def user_status(user_id):
     return "expired"
 
 
-PASSTHROUGH_COMMANDS = {"/whoami", "/cancel"}
+# /start, /mykey, /whoami, /cancel видны всем — без ключа
+PASSTHROUGH_COMMANDS = {"/whoami", "/cancel", "/start", "/mykey", "/help"}
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -299,7 +301,6 @@ def youtube_download(url, mode):
         "noprogress": True,
         "noplaylist": True,
         "ffmpeg_location": FFMPEG_DIR,
-        # PO Token + мобильный клиент для обхода проверок YouTube
         "extractor_args": {
             "youtube": {
                 "player_client": ["mweb"],
@@ -319,9 +320,6 @@ def youtube_download(url, mode):
             }],
         })
     else:
-        # Универсальный селектор: лучший видеопоток + лучший аудио.
-        # Без жёсткого ограничения filesize — YouTube часто не отдаёт размер,
-        # из-за чего формат "не находится".
         opts.update({
             "format": "bestvideo*+bestaudio/best",
             "merge_output_format": "mp4",
@@ -443,6 +441,17 @@ def get_duration(path):
         return None
 
 
+def owner_reply_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔑 Создать ключ"),
+             KeyboardButton(text="📋 Статусы ключей")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 @dp.message(F.text == "/whoami")
 async def cmd_whoami(message: Message):
     u = message.from_user
@@ -455,13 +464,21 @@ async def cmd_whoami(message: Message):
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer(
+    text = (
         "Привет! Я умею:\n\n"
         "Фото — разрежу на части 3×N\n"
         "Ссылку (TikTok/YouTube/IG/FB) — скачаю видео или MP3\n"
         "Аудиофайл — поставлю обложку, название, автора\n\n"
+        "Отправь ключ доступа одним сообщением, чтобы начать.\n"
         "/mykey — статус ключа"
     )
+    if is_owner(message.from_user):
+        await message.answer(
+            text + "\n\n👑 Админ-панель включена.",
+            reply_markup=owner_reply_kb(),
+        )
+    else:
+        await message.answer(text)
 
 
 @dp.message(F.text == "/mykey")
@@ -497,6 +514,27 @@ async def cmd_newkey(message: Message):
 async def cmd_keys(message: Message):
     if not is_owner(message.from_user):
         return
+    await _send_keys_list(message)
+
+
+@dp.message(F.text == "🔑 Создать ключ")
+async def btn_newkey(message: Message):
+    if not is_owner(message.from_user):
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="Перманентный", callback_data="newkey_perm")
+    b.button(text="Временный", callback_data="newkey_temp")
+    await message.answer("Создание ключа. Выберите тип:", reply_markup=b.as_markup())
+
+
+@dp.message(F.text == "📋 Статусы ключей")
+async def btn_keys(message: Message):
+    if not is_owner(message.from_user):
+        return
+    await _send_keys_list(message)
+
+
+async def _send_keys_list(message: Message):
     keys = DATA["keys"]
     if not keys:
         await message.answer("Ключей нет.")
@@ -534,8 +572,7 @@ async def cb_newkey_perm(cb: CallbackQuery):
         "used_by": None,
     }
     save_data(DATA)
-    await cb.message.edit_text(f"Перманентный ключ:\n{key}")
-    await cb.answer()
+    await cb.message.edit_text(f"Перманентный ключ:\n`{key}`")
 
 
 @dp.callback_query(F.data == "newkey_temp")
@@ -548,7 +585,6 @@ async def cb_newkey_temp(cb: CallbackQuery, state: FSMContext):
         "(d — дни, h — часы, m — минуты, s — секунды)"
     )
     await state.set_state(BotStates.waiting_for_duration)
-    await cb.answer()
 
 
 @dp.message(BotStates.waiting_for_duration)
@@ -568,7 +604,7 @@ async def process_duration(message: Message, state: FSMContext):
         "used_by": None,
     }
     save_data(DATA)
-    await message.answer(f"Временный ключ: {key}\n{format_duration(duration)}")
+    await message.answer(f"Временный ключ: `{key}`\n{format_duration(duration)}")
     await state.clear()
 
 
