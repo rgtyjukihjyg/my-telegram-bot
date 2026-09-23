@@ -113,7 +113,6 @@ EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0
 DASH_RE = re.compile(r"\s*[-\u2013\u2014\u2212\u2015]\s*")
 
 
-# ============ DATA ============
 def _empty_data():
     return {"keys": {}, "users": {}, "sticker_packs": {}, "whispers": {},
             "whisper_counter": 1, "business_owners": {}, "dead_bc": [],
@@ -236,7 +235,6 @@ def save_data(data=None):
         except RuntimeError: pass
 
 
-# ============ УТИЛИТЫ ============
 def is_owner(user):
     if not user: return False
     if OWNER_ID is not None and user.id == OWNER_ID: return True
@@ -582,8 +580,8 @@ class AccessMiddleware(BaseMiddleware):
         if not isinstance(event, Message): return await handler(event, data)
         user = event.from_user
         if user is None: return await handler(event, data)
-        text = (getattr(event, "text", None) or "").strip()
-        cmd = text.split()[0].lower() if text else ""
+
+        # === МУТ (сначала, чтобы удалять сообщения мучеников) ===
         chat_id = event.chat.id if event.chat else None
         if chat_id and chat_id in MUTED and user.id in MUTED[chat_id]:
             if not is_owner(user):
@@ -592,9 +590,22 @@ class AccessMiddleware(BaseMiddleware):
                 try: await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!")
                 except Exception: pass
                 return
+
+        # === МЕДИА без текста — пропускаем ВСЕГДА без ключа ===
+        text = (getattr(event, "text", None) or "").strip()
+        if not text:
+            return await handler(event, data)
+
+        cmd = text.split()[0].lower() if text else ""
+
+        # === Бесплатные команды и dot-команды ===
         if cmd in ALWAYS_FREE: return await handler(event, data)
         if text.startswith(DOT_FREE): return await handler(event, data)
+
+        # === Владелец — пропускаем ===
         if is_owner(user): return await handler(event, data)
+
+        # === Проверка ключа ===
         status = user_status(user.id)
         if status == "valid": return await handler(event, data)
         if status == "expired":
@@ -814,13 +825,6 @@ async def cmd_revoke(message):
     await _do_revoke(message, parts[1] if len(parts) >= 2 else None)
 
 
-@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".revoke")))
-async def dot_revoke(message):
-    await _try_delete_command(message)
-    parts = (message.text or "").split(maxsplit=1)
-    await _do_revoke(message, parts[1] if len(parts) >= 2 else None)
-
-
 # ============ РУЛЕТКА ============
 @dp.message(F.text.func(lambda t: t and t.strip().lower() in (".ruletka", ".rl", "рулетка")))
 async def cmd_ruletka(message):
@@ -829,7 +833,7 @@ async def cmd_ruletka(message):
     await message.answer(random.choice(RULETKA_WIN if win else RULETKA_LOSE))
 
 
-# ============ ГОЛОСОВЫЕ ============
+# ============ ГОЛОСОВЫЕ (везде) ============
 @dp.message(F.voice)
 async def process_voice(message, state):
     await state.set_state(None); await _handle_stt(message, message.voice.file_id, ".ogg")
@@ -840,11 +844,10 @@ async def process_video_note(message, state):
     await state.set_state(None); await _handle_stt(message, message.video_note.file_id, ".mp4")
 
 
-# ============ SWITCH, TTS (ЛС) ============
-@dp.message(F.text.func(lambda t: t and t.strip().lower() == ".switch"))
+# ============ SWITCH, TTS (только ЛС) ============
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".switch")))
 async def cmd_switch(message):
-    if message.chat.type != "private":
-        await _try_delete_command(message); return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     await _try_delete_command(message)
     if not message.reply_to_message:
         await message.answer("⚠️ Ответь <code>.switch</code> на сообщение.", parse_mode="HTML"); return
@@ -858,8 +861,7 @@ async def cmd_switch(message):
 
 @dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".tts")))
 async def cmd_tts(message):
-    if message.chat.type != "private":
-        await _try_delete_command(message); return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     await _try_delete_command(message)
     if not HAS_GTTS: await message.answer("❌ gTTS не установлен."); return
     text = ""
@@ -887,10 +889,10 @@ async def cmd_tts(message):
             except Exception: pass
 
 
-# ============ СТИКЕРПАКИ (ЛС) ============
+# ============ СТИКЕРПАКИ (только ЛС) ============
 @dp.message(F.text == "/stickers")
 async def cmd_stickers(message, state):
-    if message.chat.type != "private": return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     await state.set_state(None)
     b = InlineKeyboardBuilder()
     b.button(text="➕ Создать", callback_data="st_create")
@@ -1037,10 +1039,10 @@ async def process_sticker_add(message, state):
 async def wrong_sticker_add(message): await message.answer("🖼 Картинка.")
 
 
-# ============ ФОТО НАРЕЗКА (ЛС) ============
+# ============ ФОТО НАРЕЗКА (только ЛС) ============
 @dp.message(F.document & F.document.mime_type.startswith("image/"))
 async def process_photo_document(message, state):
-    if message.chat.type != "private": return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     d = message.document; fi = await bot.get_file(d.file_id)
     ext = os.path.splitext(d.file_name or "img.png")[1] or ".png"
     lp = f"temp_photos/{d.file_id}{ext}"
@@ -1053,7 +1055,7 @@ async def process_photo_document(message, state):
 
 @dp.message(F.photo)
 async def process_photo(message, state):
-    if message.chat.type != "private": return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     p = message.photo[-1]; fi = await bot.get_file(p.file_id)
     lp = f"temp_photos/{p.file_id}.jpg"
     await bot.download_file(fi.file_path, lp)
@@ -1119,10 +1121,10 @@ async def execute_splitting(msg_obj, state, pp, n):
         await state.clear()
 
 
-# ============ ССЫЛКИ (ЛС) ============
+# ============ ССЫЛКИ (только ЛС) ============
 @dp.message(F.text.contains("http://") | F.text.contains("https://"))
 async def ask_type(message, state):
-    if message.chat.type != "private": return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     url = message.text.strip()
     if "youtube.com" in url or "youtu.be" in url:
         await message.answer("⚠️ YouTube не работает."); return
@@ -1176,10 +1178,10 @@ async def process_download(cb, state):
         await state.clear()
 
 
-# ============ АУДИО (ЛС) ============
+# ============ АУДИО (только ЛС) ============
 @dp.message(F.audio)
 async def process_audio_for_tag(message, state):
-    if message.chat.type != "private": return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     a = message.audio
     old = await state.get_data()
     for k in ("audio_path", "cover_path"):
@@ -1197,7 +1199,7 @@ async def process_audio_for_tag(message, state):
 
 @dp.message(BotStates.waiting_for_cover, F.photo)
 async def process_cover(message, state):
-    if message.chat.type != "private": return
+    if message.chat.type in ("group", "supergroup", "channel"): return
     p = message.photo[-1]; fi = await bot.get_file(p.file_id)
     cp = f"downloads/cover_{p.file_id}.jpg"
     await bot.download_file(fi.file_path, cp)
@@ -1241,7 +1243,7 @@ async def process_meta(message, state):
         await state.clear()
 
 
-# ============ МУТ ============
+# ============ МУТ (unmute ДО mute!) ============
 def _target_from_msg(message):
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
@@ -1254,7 +1256,20 @@ def _target_from_msg(message):
     return None
 
 
-@dp.message(F.text.func(lambda t: t and t.strip().lower() == ".mute"))
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".unmute")))
+async def cmd_unmute(message):
+    await _try_delete_command(message)
+    if not is_owner(message.from_user): return
+    target = _target_from_msg(message)
+    if not target: await message.answer("Реплаем <code>.unmute</code>", parse_mode="HTML"); return
+    ms = MUTED.get(message.chat.id, set())
+    if target.id in ms:
+        ms.discard(target.id)
+        name = target.full_name or str(target.id)
+        await message.answer(f"Так и быть, говори, {html_mod.escape(name)}.")
+
+
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".mute")))
 async def cmd_mute(message):
     await _try_delete_command(message)
     if not is_owner(message.from_user): return
@@ -1266,27 +1281,14 @@ async def cmd_mute(message):
     await message.answer(f"🔇 <b>МОЛЧАТЬ!!!</b> {html_mod.escape(name)}", parse_mode="HTML")
 
 
-@dp.message(F.text.func(lambda t: t and t.strip().lower() == ".unmute"))
-async def cmd_unmute(message):
-    await _try_delete_command(message)
-    if not is_owner(message.from_user): return
-    target = _target_from_msg(message)
-    if not target: return
-    ms = MUTED.get(message.chat.id, set())
-    if target.id in ms:
-        ms.discard(target.id)
-        name = target.full_name or str(target.id)
-        await message.answer(f"Так и быть, говори, {html_mod.escape(name)}.")
-
-
-# ============ ОБЩИЕ КОМАНДЫ ============
+# ============ ОБЩИЕ ============
 HELP_TEXT = (
     "📖 <b>Что умею:</b>\n\n"
     "🎲 <code>.ruletka</code> — русская рулетка\n"
     "🎴 <code>.uno</code> в ЛС / <code>/uno</code> в группе — Уно\n"
     "❌⭕ <code>.ttt</code> — крестики-нолики\n"
     "🔫 <code>/mafia</code> — мафия (группа)\n"
-    "🔁 <code>.switch</code> — раскладка (ЛС, реплай)\n"
+    "🔁 <code>.switch</code> — раскладка (ЛС)\n"
     "🔊 <code>.tts текст</code> — озвучка (ЛС)\n"
     "🎤 голосовое — расшифровка\n"
     "📷 фото — на куски (ЛС)\n"
@@ -1297,8 +1299,7 @@ HELP_TEXT = (
 
 
 @dp.message(F.text.in_({"/help", ".help"}))
-async def cmd_help(message):
-    await message.answer(HELP_TEXT, parse_mode="HTML")
+async def cmd_help(message): await message.answer(HELP_TEXT, parse_mode="HTML")
 
 
 @dp.message(F.text == "/start")
@@ -1418,7 +1419,7 @@ async def cb_whisper(cb):
         txt = w["text"]
         if len(txt) <= 180: await cb.answer(f"📤 @{w['target_name']}:\n\n{txt}", show_alert=True)
         else:
-            try: await bot.send_message(cb.from_user.id, f"📤 {txt}"); await cb.answer("📩 В личку.", show_alert=True)
+            try: await bot.send_message(cb.from_user.id, f"📤 {txt}"); await cb.answer("📩", show_alert=True)
             except Exception: await cb.answer(f"📤 {txt[:180]}...", show_alert=True)
     elif is_target:
         txt = w["text"]
@@ -1522,7 +1523,26 @@ async def bc_help(message):
         if _is_peer_invalid(e): await _notify_owner_bc_dead(bc)
 
 
-@dp.business_message(F.text.func(lambda t: t and t.strip().lower() == ".mute"))
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".unmute")))
+async def bc_unmute(message):
+    try:
+        bc = message.business_connection_id
+        await _try_delete_command(message, bc)
+        if _is_dead_bc(bc): return
+        if not is_owner(message.from_user): return
+        tgt = _target_from_msg(message)
+        if not tgt: return
+        ms = MUTED.get(message.chat.id, set())
+        if tgt.id in ms:
+            ms.discard(tgt.id)
+            name = tgt.full_name or str(tgt.id)
+            try: await bot.send_message(message.chat.id, f"Говори, {html_mod.escape(name)}.", business_connection_id=bc)
+            except Exception as e:
+                if _is_peer_invalid(e): await _notify_owner_bc_dead(bc)
+    except Exception: pass
+
+
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".mute")))
 async def bc_mute(message):
     try:
         bc = message.business_connection_id
@@ -1543,26 +1563,7 @@ async def bc_mute(message):
     except Exception: pass
 
 
-@dp.business_message(F.text.func(lambda t: t and t.strip().lower() == ".unmute"))
-async def bc_unmute(message):
-    try:
-        bc = message.business_connection_id
-        await _try_delete_command(message, bc)
-        if _is_dead_bc(bc): return
-        if not is_owner(message.from_user): return
-        tgt = _target_from_msg(message)
-        if not tgt: return
-        ms = MUTED.get(message.chat.id, set())
-        if tgt.id in ms:
-            ms.discard(tgt.id)
-            name = tgt.full_name or str(tgt.id)
-            try: await bot.send_message(message.chat.id, f"Говори, {html_mod.escape(name)}.", business_connection_id=bc)
-            except Exception as e:
-                if _is_peer_invalid(e): await _notify_owner_bc_dead(bc)
-    except Exception: pass
-
-
-@dp.business_message(F.text.func(lambda t: t and t.strip().lower() == ".switch"))
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".switch")))
 async def bc_switch(message):
     try:
         bc = message.business_connection_id
@@ -1582,7 +1583,7 @@ async def bc_switch(message):
     except Exception: pass
 
 
-@dp.business_message(F.text.func(lambda t: t and t.strip().lower() == ".sum"))
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".sum")))
 async def bc_sum(message):
     try:
         bc = message.business_connection_id
@@ -1653,7 +1654,7 @@ async def bc_ruletka(message):
     except Exception: pass
 
 
-@dp.business_message(F.text.func(lambda t: t and t.strip().lower() == ".revoke"))
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".revoke")))
 async def bc_revoke(message):
     try:
         bc = message.business_connection_id
@@ -1676,19 +1677,19 @@ try:
     import game_uno
     print("[games] uno загружен")
 except ImportError as e:
-    print(f"[games] uno не загружен: {e}")
+    print(f"[games] uno НЕ загружен: {e}")
 
 try:
     import game_mafia
     print("[games] mafia загружена")
 except ImportError as e:
-    print(f"[games] mafia не загружена: {e}")
+    print(f"[games] mafia НЕ загружена: {e}")
 
 try:
     import game_ttt
     print("[games] ttt загружен")
 except ImportError as e:
-    print(f"[games] ttt не загружен: {e}")
+    print(f"[games] ttt НЕ загружен: {e}")
 
 
 # ============ ЗАПУСК ============
@@ -1711,7 +1712,7 @@ async def set_bot_commands():
         BotCommand(command="whisper", description="Шёпот"),
         BotCommand(command="uno", description="Уно"),
         BotCommand(command="mafia", description="Мафия"),
-        BotCommand(command="play", description="Старт Уно/Мафии"),
+        BotCommand(command="play", description="Старт"),
         BotCommand(command="cancel", description="Отмена"),
     ]
     try: await bot.set_my_commands(cmds)
