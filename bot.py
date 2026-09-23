@@ -49,11 +49,8 @@ dp = Dispatcher()
 BOT_USERNAME_CACHE = None
 STT_MODEL = None
 
-# Крестики-нолики: chat_id -> состояние игры
 TTT_GAMES = {}
-# Мут: chat_id -> set(user_id)
 MUTED = {}
-# Business-соединения
 BUSINESS_CONNECTIONS = {}
 
 
@@ -307,7 +304,6 @@ class AccessMiddleware(BaseMiddleware):
         text = (getattr(event, "text", None) or "").strip()
         cmd = text.split()[0].lower() if text else ""
 
-        # Мут: удаляем сообщения замученного
         chat_id = event.chat.id if event.chat else None
         if chat_id and chat_id in MUTED and user.id in MUTED[chat_id]:
             if not is_owner(user):
@@ -546,6 +542,7 @@ def other_site_download(url, mode):
     return final, title, info.get("duration"), performer, info.get("thumbnail")
 
 
+# FIX: равномерное распределение остатка по 1 пикселю между частями
 def split_image(image_path, total_parts):
     img = Image.open(image_path)
     if img.mode != "RGB":
@@ -553,27 +550,44 @@ def split_image(image_path, total_parts):
     w, h = img.size
     cols = 3
     rows = total_parts // cols
-    pw = w // cols
-    ph = h // rows
+
+    base_w = w // cols
+    rem_w = w % cols
+    widths = [base_w + (1 if i < rem_w else 0) for i in range(cols)]
+
+    base_h = h // rows
+    rem_h = h % rows
+    heights = [base_h + (1 if i < rem_h else 0) for i in range(rows)]
+
     files = []
+    y = 0
     for row in range(rows):
+        x = 0
         for col in range(cols):
-            left = col * pw
-            top = row * ph
-            right = (col + 1) * pw if col < cols - 1 else w
-            bottom = (row + 1) * ph if row < rows - 1 else h
+            left = x
+            top = y
+            right = x + widths[col]
+            bottom = y + heights[row]
             crop = img.crop((left, top, right, bottom))
             fn = f"temp_photos/part_{row}_{col}.png"
             crop.save(fn, "PNG", optimize=False, compress_level=1)
             files.append(fn)
+            x = right
+        y = bottom
     return files
 
 
+# FIX: ограничение максимум 9 частями
 def calculate_auto_parts(image_path):
     img = Image.open(image_path)
     w, h = img.size
-    rows = max(1, round(h / (w / 3)))
-    return rows * 3
+    ratio = h / w
+    if ratio > 1.5:
+        return 9   # 3x3
+    elif ratio > 1.0:
+        return 6   # 3x2
+    else:
+        return 3   # 3x1
 
 
 def apply_tags(audio_path, cover_path, title, performer):
@@ -770,8 +784,6 @@ def ttt_check_winner(board):
 
 
 async def _ttt_refresh(old_message: Message, game: dict, bc_id: str = None):
-    """В бизнес-чате удаляем старое сообщение и шлём новое,
-    в обычном — редактируем."""
     chat_id = old_message.chat.id
     text = ttt_board_text(game)
     kb = ttt_keyboard(game)
@@ -1011,13 +1023,11 @@ async def cmd_unmute(message: Message):
 
 @dp.business_connection()
 async def on_business_connection(connection):
-    """Следим за подключением/отключением бизнес-бота."""
     try:
         if connection.is_enabled:
             BUSINESS_CONNECTIONS[connection.id] = connection.user.id
             print(f"Business подключён: {connection.id} -> user {connection.user.id}")
 
-            # Уведомление владельцу в личку
             try:
                 await bot.send_message(
                     connection.user.id,
@@ -1036,8 +1046,6 @@ async def on_business_connection(connection):
     except Exception as e:
         print(f"business_connection err: {e}")
 
-
-# ---------------- .ttt в Business Chat ----------------
 
 @dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".ttt")))
 async def bc_cmd_ttt(message: Message):
@@ -1073,8 +1081,6 @@ async def bc_cmd_ttt(message: Message):
         business_connection_id=bc_id,
     )
 
-
-# ---------------- .mute / .unmute в Business Chat ----------------
 
 @dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".mute")))
 async def bc_cmd_mute(message: Message):
@@ -1136,8 +1142,6 @@ async def bc_cmd_unmute(message: Message):
             business_connection_id=bc_id,
         )
 
-
-# ---------------- Мут: удаление бизнес-сообщений ----------------
 
 @dp.business_message()
 async def bc_mute_enforcer(message: Message):
@@ -1935,6 +1939,32 @@ async def process_meta(message: Message, state: FSMContext):
         await state.clear()
 
 
+# ============================================================
+#         ОБРАБОТКА ФОТО (нарезка) — С ФИКСОМ КАЧЕСТВА
+# ============================================================
+
+# FIX: обработчик документа-картинки (без сжатия Telegram)
+@dp.message(F.document & F.document.mime_type.startswith("image/"))
+async def process_photo_document(message: Message, state: FSMContext):
+    d = message.document
+    fi = await bot.get_file(d.file_id)
+    ext = os.path.splitext(d.file_name or "img.png")[1] or ".png"
+    lp = f"temp_photos/{d.file_id}{ext}"
+    await bot.download_file(fi.file_path, lp)
+    await state.update_data(photo_path=lp)
+    await state.set_state(BotStates.waiting_for_parts)
+    b = InlineKeyboardBuilder()
+    b.button(text="🎲 На твоё усмотрение", callback_data="auto_split")
+    b.button(text="📎 Отправить оригинал", callback_data="send_original")
+    await message.answer(
+        "✂️ На сколько кусочков резать?\n"
+        "Число должно делиться на 3 (например, 6, 9, 12).\n"
+        "Или жми кнопку — сам прикину.\n\n"
+        "✅ Файл принят в оригинальном качестве.",
+        reply_markup=b.as_markup(),
+    )
+
+
 @dp.message(F.photo)
 async def process_photo(message: Message, state: FSMContext):
     p = message.photo[-1]
@@ -1945,10 +1975,12 @@ async def process_photo(message: Message, state: FSMContext):
     await state.set_state(BotStates.waiting_for_parts)
     b = InlineKeyboardBuilder()
     b.button(text="🎲 На твоё усмотрение", callback_data="auto_split")
+    b.button(text="📎 Отправить оригинал", callback_data="send_original")
     await message.answer(
-        "✂️ На сколько кусочков резать?\n"
-        "Число должно делиться на 3 (например, 6, 9, 12).\n"
-        "Или жми кнопку — сам прикину.",
+        "⚠️ Фото сжато Telegram — мелкие детали (сердечки, тонкие линии) могут быть потеряны.\n"
+        "Чтобы сохранить качество, пришли картинку **как файл** (📎 → Файл).\n\n"
+        "✂️ На сколько кусочков резать? (кратно 3)\n"
+        "Или жми кнопку.",
         reply_markup=b.as_markup(),
     )
 
@@ -1966,6 +1998,24 @@ async def auto_split(cb: CallbackQuery, state: FSMContext):
     n = await loop.run_in_executor(None, calculate_auto_parts, pp)
     await cb.message.answer(f"🎲 Прикинул: {n} кусочков.")
     await execute_splitting(cb.message, state, pp, n)
+    await cb.answer()
+
+
+# FIX: кнопка «Отправить оригинал» без нарезки
+@dp.callback_query(F.data == "send_original", BotStates.waiting_for_parts)
+async def send_original(cb: CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    pp = d.get("photo_path")
+    if not pp or not os.path.exists(pp):
+        await cb.answer("Файл потерялся", show_alert=True)
+        await state.clear()
+        return
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer_document(
+        FSInputFile(pp, filename=os.path.basename(pp)),
+        caption="📎 Оригинал без изменений."
+    )
+    await state.clear()
     await cb.answer()
 
 
