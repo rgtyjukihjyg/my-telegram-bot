@@ -5,7 +5,6 @@ import time
 import asyncio
 import secrets
 import random
-import itertools
 import urllib.request
 import urllib.parse
 import subprocess
@@ -53,6 +52,8 @@ TTT_GAMES = {}
 MUTED = {}
 BUSINESS_CONNECTIONS = {}
 
+WHISPER_TTL = 86400  # 24 часа
+
 
 class BotStates(StatesGroup):
     waiting_for_parts = State()
@@ -68,9 +69,6 @@ class BotStates(StatesGroup):
 
 os.makedirs("downloads", exist_ok=True)
 os.makedirs("temp_photos", exist_ok=True)
-
-WHISPERS = {}
-_whisper_counter = itertools.count(1)
 
 FUNNY_REPLIES = [
     "Ержан, фу, нельзя, место!",
@@ -91,7 +89,7 @@ FUNNY_REPLIES = [
 
 
 def _empty_data():
-    return {"keys": {}, "users": {}, "sticker_packs": {}}
+    return {"keys": {}, "users": {}, "sticker_packs": {}, "whispers": {}, "whisper_counter": 1}
 
 
 def load_data_from_file():
@@ -102,6 +100,8 @@ def load_data_from_file():
                 d.setdefault("keys", {})
                 d.setdefault("users", {})
                 d.setdefault("sticker_packs", {})
+                d.setdefault("whispers", {})
+                d.setdefault("whisper_counter", 1)
                 return d
         except Exception as e:
             print(f"load_data_from_file: {e}")
@@ -156,7 +156,9 @@ async def load_data_from_tg():
         d.setdefault("keys", {})
         d.setdefault("users", {})
         d.setdefault("sticker_packs", {})
-        print(f"load_data_from_tg OK: keys={len(d['keys'])}, users={len(d['users'])}")
+        d.setdefault("whispers", {})
+        d.setdefault("whisper_counter", 1)
+        print(f"load_data_from_tg OK: keys={len(d['keys'])}, users={len(d['users'])}, whispers={len(d['whispers'])}")
         save_data_to_file(d)
         return d
     except Exception as e:
@@ -288,10 +290,20 @@ def user_status(user_id):
     return "expired"
 
 
+def cleanup_expired_whispers():
+    now = time.time()
+    w = DATA.get("whispers", {})
+    expired = [wid for wid, wd in w.items() if wd.get("expires", 0) < now]
+    for wid in expired:
+        del w[wid]
+    if expired:
+        print(f"whispers cleanup: удалено {len(expired)} просроченных")
+
+
 PASSTHROUGH_COMMANDS = {
-    "/whoami", "/cancel", "/start", "/mykey", "/help", "/code", "/whisper",
+    "/whoami", "/cancel", "/start", "/mykey", "/help", "/code", "/whisper", "/revoke",
 }
-DOT_COMMANDS = (".ttt", ".mute", ".unmute", ".xo")
+DOT_COMMANDS = (".ttt", ".mute", ".unmute", ".xo", ".revoke")
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -359,9 +371,16 @@ async def try_activate_key(event, user, key):
         if str(used_by) == user_id:
             u = DATA["users"].get(user_id, {})
             if u.get("permanent"):
-                await event.answer("😉 Ты уже активировал этот ключ.")
+                await event.answer("😉 Ты уже активировал этот ключ (навсегда).")
             else:
-                await event.answer(f"😉 Уже активирован. До {format_until(u.get('expires_at', 0))}")
+                exp = u.get("expires_at", 0)
+                rem = max(0, exp - time.time())
+                await event.answer(
+                    f"😉 Ключ уже активирован.\n\n"
+                    f"⏳ Осталось: *{format_duration(rem)}*\n"
+                    f"📅 До: *{format_until(exp)}*",
+                    parse_mode="Markdown",
+                )
         else:
             await event.answer("⚠️ Этот ключ уже занят другим аккаунтом.")
         return
@@ -381,11 +400,15 @@ async def try_activate_key(event, user, key):
     DATA["users"][user_id] = entry
     save_data(DATA)
     if permanent:
-        await event.answer("✅ Готово! Ключ активирован навсегда.")
+        await event.answer(
+            "✅ *Ключ активирован!*\n\n"
+            "♾ Тип: навсегда"
+        )
     else:
         await event.answer(
-            f"✅ Ключ активирован на {format_duration(duration)}\n"
-            f"📅 Действует до {format_until(now + duration)}"
+            f"✅ *Ключ активирован!*\n\n"
+            f"⏱ Ключ действует: *{format_duration(duration)}*\n"
+            f"📅 Дата истечения: *{format_until(now + duration)}*"
         )
 
 
@@ -542,7 +565,6 @@ def other_site_download(url, mode):
     return final, title, info.get("duration"), performer, info.get("thumbnail")
 
 
-# FIX: картинка чуть сжимается, чтобы делилась ровно; все куски строго одинакового размера
 def split_image(image_path, total_parts):
     img = Image.open(image_path)
     if img.mode != "RGB":
@@ -553,15 +575,13 @@ def split_image(image_path, total_parts):
 
     w, h = img.size
 
-    # Размер, который делится на cols и rows без остатка
     new_w = (w // cols) * cols
     new_h = (h // rows) * rows
 
-    # Сжимаем максимум на 1-2 пикселя — глазу не видно, зато никаких смещений
     if new_w != w or new_h != h:
         img = img.resize((new_w, new_h), Image.LANCZOS)
         w, h = img.size
-        print(f"split: {w}x{h} -> ровная сетка {cols}x{rows}")
+        print(f"split: -> ровная сетка {cols}x{rows} ({w}x{h})")
 
     pw = w // cols
     ph = h // rows
@@ -580,17 +600,16 @@ def split_image(image_path, total_parts):
     return files
 
 
-# FIX: ограничение максимум 9 частями
 def calculate_auto_parts(image_path):
     img = Image.open(image_path)
     w, h = img.size
     ratio = h / w
     if ratio > 1.5:
-        return 9   # 3x3
+        return 9
     elif ratio > 1.0:
-        return 6   # 3x2
+        return 6
     else:
-        return 3   # 3x1
+        return 3
 
 
 def apply_tags(audio_path, cover_path, title, performer):
@@ -1038,7 +1057,8 @@ async def on_business_connection(connection):
                     "📖 Доступные команды в бизнес-чате:\n"
                     "• `.ttt` — крестики-нолики\n"
                     "• `.mute` — замутить собеседника (ответом на его сообщение)\n"
-                    "• `.unmute` — снять мут\n\n"
+                    "• `.unmute` — снять мут\n"
+                    "• `.revoke` — отозвать доступ (ответом на сообщение)\n\n"
                     "⚠️ Команды работают только в личке этого аккаунта."
                 )
             except Exception as e:
@@ -1248,14 +1268,19 @@ async def cmd_mykey(message: Message):
         await message.answer("🤷 У тебя пока нет активного ключа.")
         return
     if u.get("permanent"):
-        await message.answer(f"🔑 Твой ключ: {u.get('key')}\n♾ Тип: навсегда")
+        await message.answer(
+            f"🔑 Твой ключ: `{u.get('key')}`\n"
+            f"♾ Тип: навсегда",
+            parse_mode="Markdown",
+        )
     else:
         exp = u.get("expires_at", 0)
         rem = max(0, exp - time.time())
         await message.answer(
-            f"🔑 Твой ключ: {u.get('key')}\n"
-            f"📅 До: {format_until(exp)}\n"
-            f"⏳ Осталось: {format_duration(rem)}"
+            f"🔑 Твой ключ: `{u.get('key')}`\n"
+            f"⏳ Осталось: *{format_duration(rem)}*\n"
+            f"📅 До: *{format_until(exp)}*",
+            parse_mode="Markdown",
         )
 
 
@@ -1276,14 +1301,147 @@ async def cmd_keys(message: Message):
     await _send_keys_list(message)
 
 
-def _text_has(text, *words):
-    if not text:
-        return False
-    tl = text.lower()
-    return all(w.lower() in tl for w in words)
+# ============================================================
+#                    ОТЗЫВ КЛЮЧА / ДОСТУПА
+# ============================================================
+
+def _revoke_by_user_id(uid: str):
+    uid = str(uid)
+    u = DATA["users"].pop(uid, None)
+    if not u:
+        return None
+    key = u.get("key")
+    key_deleted = False
+    if key and key in DATA["keys"]:
+        del DATA["keys"][key]
+        key_deleted = True
+    return {
+        "uid": uid,
+        "username": u.get("username") or "",
+        "key": key,
+        "key_deleted": key_deleted,
+    }
 
 
-@dp.message(F.text.func(lambda t: _text_has(t, "создать", "ключ")))
+def _revoke_by_username(uname: str):
+    uname_l = uname.lower().lstrip("@")
+    for uid, udata in list(DATA["users"].items()):
+        if (udata.get("username") or "").lower() == uname_l:
+            return _revoke_by_user_id(uid)
+    return None
+
+
+def _revoke_by_keycode(code: str):
+    code = code.strip().upper()
+    kd = DATA["keys"].get(code)
+    if not kd:
+        return None
+    used_by = kd.get("used_by")
+    del DATA["keys"][code]
+    user_removed = False
+    if used_by and str(used_by) in DATA["users"]:
+        del DATA["users"][str(used_by)]
+        user_removed = True
+    return {
+        "key": code,
+        "used_by": used_by,
+        "user_removed": user_removed,
+    }
+
+
+async def _do_revoke(message: Message, arg: str = None):
+    if not is_owner(message.from_user):
+        await message.answer("Только владелец может отзывать ключи.")
+        return
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        tgt = message.reply_to_message.from_user
+        if is_owner(tgt):
+            await message.answer("Владельца не трогаем.")
+            return
+        info = _revoke_by_user_id(tgt.id)
+        if info:
+            save_data(DATA)
+            await message.answer(
+                f"✅ Доступ @{info['username'] or info['uid']} отозван.\n"
+                f"Ключ: {info['key'] or '—'}"
+                + ("" if info["key_deleted"] else " (уже отсутствовал)")
+            )
+        else:
+            await message.answer("🤷 У этого юзера нет активного доступа.")
+        return
+
+    if not arg:
+        await message.answer(
+            "📖 *Как отзывать доступ:*\n\n"
+            "• `/revoke KEYCODE` — удалить конкретный ключ (даже активированный)\n"
+            "• `/revoke @username` — отозвать доступ у юзера\n"
+            "• `/revoke 123456789` — по user_id\n"
+            "• Ответом на сообщение юзера: `/revoke`\n\n"
+            "⚠️ Если удаляешь активированный ключ — доступ юзера тоже снимется.",
+            parse_mode="Markdown",
+        )
+        return
+
+    arg = arg.strip()
+
+    info = _revoke_by_keycode(arg)
+    if info:
+        save_data(DATA)
+        extra = ""
+        if info["used_by"]:
+            extra = f"\nДоступ юзера {info['used_by']} снят." if info["user_removed"] else "\n(юзера уже не было в базе)"
+        await message.answer(f"✅ Ключ `{info['key']}` аннулирован.{extra}", parse_mode="Markdown")
+        return
+
+    if arg.isdigit():
+        info = _revoke_by_user_id(arg)
+        if info:
+            save_data(DATA)
+            await message.answer(
+                f"✅ Доступ {info['uid']} (@{info['username'] or '?'}) отозван.\n"
+                f"Ключ: {info['key'] or '—'}"
+            )
+            return
+
+    uname = arg.lstrip("@")
+    info = _revoke_by_username(uname)
+    if info:
+        save_data(DATA)
+        await message.answer(
+            f"✅ Доступ @{info['username'] or uname} отозван.\n"
+            f"Ключ: {info['key'] or '—'}"
+        )
+        return
+
+    await message.answer("🤷 Ни ключ, ни юзер не найдены.")
+
+
+@dp.message(F.text == "/revoke")
+async def cmd_revoke(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1] if len(parts) >= 2 else None
+    await _do_revoke(message, arg)
+
+
+@dp.message(F.text.startswith("/revoke "))
+async def cmd_revoke_with_arg(message: Message):
+    arg = message.text.split(maxsplit=1)[1]
+    await _do_revoke(message, arg)
+
+
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".revoke")))
+async def dot_revoke(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    arg = parts[1] if len(parts) >= 2 else None
+    await _do_revoke(message, arg)
+
+
+# ============================================================
+#              КНОПКИ ВЛАДЕЛЬЦА (reply keyboard)
+# ============================================================
+
+@dp.message(F.text.contains("оздать"))
 async def btn_newkey(message: Message):
     print(f"btn_newkey HIT: text={message.text!r}")
     if not is_owner(message.from_user):
@@ -1295,7 +1453,7 @@ async def btn_newkey(message: Message):
     await message.answer("❓ Какой ключ делаем?", reply_markup=b.as_markup())
 
 
-@dp.message(F.text.func(lambda t: _text_has(t, "статус")))
+@dp.message(F.text.contains("татус"))
 async def btn_keys(message: Message):
     print(f"btn_keys HIT: text={message.text!r}")
     if not is_owner(message.from_user):
@@ -1304,29 +1462,43 @@ async def btn_keys(message: Message):
     await _send_keys_list(message)
 
 
-async def _send_keys_list(message: Message):
+def _render_keys_list():
+    """Возвращает (text, keyboard) для списка ключей."""
     keys = DATA["keys"]
     if not keys:
-        await message.answer("🗂 Пока ни одного ключа нет.")
-        return
-    lines = ["🗂 Все ключи:\n"]
+        return "🗂 Пока ни одного ключа нет.", None
+
+    lines = ["🗂 *Все ключи:*\n"]
+    b = InlineKeyboardBuilder()
+
     for k, kd in keys.items():
         if kd.get("used_by"):
             u = DATA["users"].get(str(kd["used_by"]), {})
             uname = u.get("username") or "?"
             if u.get("permanent"):
-                status = "♾ активен"
+                status = "♾ навсегда"
             elif u.get("expires_at", 0) > time.time():
-                status = f"⏳ до {format_until(u.get('expires_at', 0))}"
+                exp = u.get("expires_at", 0)
+                rem = max(0, exp - time.time())
+                status = f"⏳ {format_duration(rem)} (до {format_until(exp)})"
             else:
                 status = "❌ истёк"
-            lines.append(f"{k} → @{uname} ({status})")
+            lines.append(f"`{k}` → @{uname} — {status}")
         else:
             if kd.get("permanent"):
-                lines.append(f"{k} — ♾ свободен")
+                lines.append(f"`{k}` — ♾ свободен")
             else:
-                lines.append(f"{k} — ⏳ {format_duration(kd.get('duration', 0))}, свободен")
-    await message.answer("\n".join(lines))
+                lines.append(f"`{k}` — ⏳ {format_duration(kd.get('duration', 0))}, свободен")
+
+        b.button(text=f"🗑 Удалить {k}", callback_data=f"revoke_key:{k}")
+
+    b.adjust(1)
+    return "\n".join(lines), b.as_markup()
+
+
+async def _send_keys_list(message: Message):
+    text, kb = _render_keys_list()
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 
 @dp.callback_query(F.data == "newkey_perm")
@@ -1342,7 +1514,7 @@ async def cb_newkey_perm(cb: CallbackQuery):
         "used_by": None,
     }
     save_data(DATA)
-    await cb.message.edit_text(f"♾ Перманентный ключ:\n{key}\n\n📤 Отправь его юзеру.")
+    await cb.message.edit_text(f"♾ Перманентный ключ:\n`{key}`\n\n📤 Отправь его юзеру.", parse_mode="Markdown")
 
 
 @dp.callback_query(F.data == "newkey_temp")
@@ -1375,9 +1547,47 @@ async def process_duration(message: Message, state: FSMContext):
     }
     save_data(DATA)
     await message.answer(
-        f"⏳ Временный ключ:\n{key}\n⏱ Живёт {format_duration(duration)}"
+        f"⏳ Временный ключ:\n`{key}`\n⏱ Живёт {format_duration(duration)}",
+        parse_mode="Markdown",
     )
     await state.clear()
+
+
+# Кнопка "🗑 Удалить <KEY>" из списка ключей
+@dp.callback_query(F.data.startswith("revoke_key:"))
+async def cb_revoke_key(cb: CallbackQuery):
+    if not is_owner(cb.from_user):
+        await cb.answer("Только владелец может удалять ключи.", show_alert=True)
+        return
+
+    code = cb.data.split(":", 1)[1].strip().upper()
+    info = _revoke_by_keycode(code)
+
+    if not info:
+        await cb.answer("Ключ уже удалён.", show_alert=True)
+        text, kb = _render_keys_list()
+        try:
+            await cb.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+    save_data(DATA)
+
+    extra = ""
+    if info["used_by"]:
+        if info["user_removed"]:
+            extra = f"\n🔓 Доступ юзера {info['used_by']} снят."
+        else:
+            extra = "\n(доступ юзера уже отсутствовал)"
+
+    await cb.answer(f"✅ Ключ {code} удалён.{extra}", show_alert=True)
+
+    text, kb = _render_keys_list()
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    except Exception as e:
+        print(f"list refresh err: {e}")
 
 
 @dp.message(F.text == "/cancel")
@@ -1414,9 +1624,19 @@ async def cmd_whisper(message: Message):
         f"1. Напиши в любом чате: `@{bot_uname} текст @username`\n"
         f"2. Сверху появится подсказка — выбери её\n"
         f"3. Отправь — прочитает только адресат\n\n"
-        f"Например: `@{bot_uname} привет, ты классный @vimbrix`",
+        f"Шёпот живёт 24 часа и переживает перезапуск бота.",
         parse_mode="Markdown",
     )
+
+
+# ============================================================
+#                  ШЁПОТ (с персистентностью)
+# ============================================================
+
+def _next_whisper_id() -> int:
+    c = int(DATA.get("whisper_counter", 1))
+    DATA["whisper_counter"] = c + 1
+    return c
 
 
 @dp.inline_query()
@@ -1485,15 +1705,17 @@ async def inline_whisper(query: InlineQuery):
             target_id = int(uid)
             break
 
-    wid = next(_whisper_counter)
-    WHISPERS[wid] = {
+    wid = _next_whisper_id()
+    DATA["whispers"][str(wid)] = {
         "target_id": target_id,
         "target_name": target_username,
         "text": whisper_text,
         "from_id": query.from_user.id,
         "from_name": query.from_user.full_name,
-        "expires": time.time() + 86400,
+        "expires": time.time() + WHISPER_TTL,
     }
+    save_data(DATA)
+    print(f"whisper #{wid} сохранён (для @{target_username}), всего: {len(DATA['whispers'])}")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👁 Прочитать содержимое", callback_data=f"whisper:{wid}")],
@@ -1518,27 +1740,29 @@ async def inline_whisper(query: InlineQuery):
 @dp.callback_query(F.data.startswith("whisper:"))
 async def cb_whisper(cb: CallbackQuery):
     try:
-        wid = int(cb.data.split(":", 1)[1])
+        wid_str = cb.data.split(":", 1)[1]
+        wid = int(wid_str)
     except (ValueError, IndexError):
         await cb.answer("Шёпот сломался.", show_alert=True)
         return
 
-    w = WHISPERS.get(wid)
+    w = DATA["whispers"].get(str(wid))
     if not w:
         await cb.answer("Этот шёпот уже улетел в никуда.", show_alert=True)
         return
-    if w["expires"] < time.time():
-        WHISPERS.pop(wid, None)
+    if w.get("expires", 0) < time.time():
+        DATA["whispers"].pop(str(wid), None)
+        save_data(DATA)
         await cb.answer("Шёпот устарел и растворился.", show_alert=True)
         return
 
     is_target = False
-    if w["target_id"] is not None and cb.from_user.id == w["target_id"]:
+    if w.get("target_id") is not None and cb.from_user.id == w["target_id"]:
         is_target = True
-    if (cb.from_user.username or "").lower() == w["target_name"].lower():
+    if (cb.from_user.username or "").lower() == (w.get("target_name") or "").lower():
         is_target = True
 
-    is_sender = cb.from_user.id == w["from_id"]
+    is_sender = cb.from_user.id == w.get("from_id")
 
     if is_sender:
         txt = w["text"]
@@ -2047,14 +2271,14 @@ async def execute_splitting(msg_obj, state, pp, n):
 
         parts = sorted(parts, key=sort_key)
         total = len(parts)
-        print(f"split: {total} частей, порядок: {[os.path.basename(p) for p in parts[:6]]}...")
+        print(f"split: {total} частей")
 
         for i, pf in enumerate(parts):
             if not os.path.exists(pf):
                 continue
             idx = i + 1
-            await msg_obj.answer_document(
-                FSInputFile(pf, filename=f"{idx:02d}.png"),
+            await msg_obj.answer_photo(
+                photo=FSInputFile(pf, filename=f"{idx:02d}.png"),
                 caption=f"{idx}/{total}",
             )
             await asyncio.sleep(0.4)
@@ -2068,7 +2292,7 @@ async def execute_splitting(msg_obj, state, pp, n):
 
         await st.delete()
         await msg_obj.answer(
-            f"✅ Готово! {total} кусочков (PNG, без сжатия).\n"
+            f"✅ Готово! {total} кусочков.\n"
             f"Порядок: слева-направо, сверху-вниз (01 → {total:02d})."
         )
     except Exception as e:
@@ -2232,7 +2456,8 @@ dp.message.middleware(AccessMiddleware())
 async def main():
     global DATA
     DATA = await load_data_from_tg()
-    print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}")
+    cleanup_expired_whispers()
+    print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}, whispers: {len(DATA['whispers'])}")
     await set_bot_commands()
     await set_bot_menu()
     asyncio.create_task(preload_stt())
