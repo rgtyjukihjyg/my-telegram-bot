@@ -1,24 +1,26 @@
-import os, sys, re, json, time, html as html_mod, asyncio, secrets, random, shutil
+import os, sys, fcntl, re, json, time, html as html_mod, asyncio, secrets, random, shutil
 import urllib.request, urllib.parse, subprocess
 from collections import Counter
 
-# === ЗАЩИТА ОТ ДВУХ ИНСТАНСОВ ===
+# === ЗАЩИТА ОТ ДВУХ ИНСТАНСОВ (flock) ===
 _LOCK_FILE = "/tmp/nokest_bot.lock"
-try:
-    if os.path.exists(_LOCK_FILE):
-        with open(_LOCK_FILE, "r") as f:
-            _old_pid = f.read().strip()
-        try:
-            os.kill(int(_old_pid), 0)
-            print(f"❌ Другой инстанс уже работает (PID={_old_pid}). Выхожу.")
-            sys.exit(1)
-        except (OSError, ValueError):
-            pass
-    with open(_LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    print(f"🔒 Lock установлен: PID={os.getpid()}")
-except Exception as e:
-    print(f"Lock err: {e}")
+_lock_fd = None
+
+def _acquire_lock():
+    global _lock_fd
+    try:
+        _lock_fd = open(_LOCK_FILE, "w")
+        fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd.write(str(os.getpid()))
+        _lock_fd.flush()
+        print(f"🔒 Lock установлен: PID={os.getpid()}")
+        return True
+    except (IOError, OSError, BlockingIOError):
+        print("❌ Другой инстанс уже работает, выходим")
+        return False
+
+if not _acquire_lock():
+    sys.exit(0)
 
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import (
@@ -1707,7 +1709,6 @@ dp.message.middleware(AccessMiddleware())
 async def main():
     global DATA
 
-    # Подключаем игры ТОЛЬКО ЗДЕСЬ, после полной инициализации bot.py
     try:
         import game_uno
         print("[games] uno загружен")
