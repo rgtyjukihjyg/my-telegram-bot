@@ -1,6 +1,25 @@
-import os, re, json, time, html as html_mod, asyncio, secrets, random, shutil
+import os, sys, re, json, time, html as html_mod, asyncio, secrets, random, shutil
 import urllib.request, urllib.parse, subprocess
 from collections import Counter
+
+# === ЗАЩИТА ОТ ДВУХ ИНСТАНСОВ ===
+_LOCK_FILE = "/tmp/nokest_bot.lock"
+try:
+    if os.path.exists(_LOCK_FILE):
+        with open(_LOCK_FILE, "r") as f:
+            _old_pid = f.read().strip()
+        try:
+            os.kill(int(_old_pid), 0)
+            print(f"❌ Другой инстанс уже работает (PID={_old_pid}). Выхожу.")
+            sys.exit(1)
+        except (OSError, ValueError):
+            pass
+    with open(_LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    print(f"🔒 Lock установлен: PID={os.getpid()}")
+except Exception as e:
+    print(f"Lock err: {e}")
+
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import (
     Message, FSInputFile, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
@@ -25,7 +44,6 @@ except ImportError:
     HAS_GTTS = False
     print("[tts] gTTS не установлен")
 
-# ============ КОНФИГ ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN: raise ValueError("нет BOT_TOKEN")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID")
@@ -36,7 +54,7 @@ if _eid and _eid.strip().isdigit(): OWNER_ID = int(_eid)
 DATA_FILE = "data.json"
 KEY_LENGTH = 12
 KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-STT_SIZE = os.environ.get("STT_SIZE", "base")
+STT_SIZE = os.environ.get("STT_SIZE", "small")
 PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 WHISPER_TTL = 86400
 HISTORY_LIMIT = 60
@@ -492,10 +510,8 @@ FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_exec
 FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
 print(f"ffmpeg: {FFMPEG_EXE_PATH}")
 cleanup_folders()
-print("Временные папки очищены")
 
 
-# ============ STT ============
 def get_stt_model():
     global STT_MODEL
     if STT_MODEL is None:
@@ -514,8 +530,12 @@ def convert_to_wav(src, dst):
 
 def transcribe_wav(wav):
     model = get_stt_model()
-    segs, info = model.transcribe(wav, language="ru", beam_size=5, vad_filter=True,
-                                   initial_prompt="Голосовое на русском.")
+    segs, info = model.transcribe(
+        wav, language="ru", beam_size=5, vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+        initial_prompt="Голосовое сообщение. Возможен мат и разговорная речь.",
+        condition_on_previous_text=False, temperature=0.0,
+        compression_ratio_threshold=2.4, no_speech_threshold=0.6)
     return " ".join(s.text.strip() for s in segs).strip(), info.language
 
 
@@ -569,7 +589,6 @@ def _tts_generate(text, out):
     gTTS(text=text, lang="ru").save(out); return out
 
 
-# ============ MIDDLEWARE ============
 ALWAYS_FREE = {"/start", "/help", "/code", "/mykey", "/whoami", "/whisper", "/cancel", ".help"}
 DOT_FREE = (".uno", ".ruletka", ".rl", ".switch", ".tts", ".sum",
             ".ttt", ".mute", ".unmute", ".revoke")
@@ -581,7 +600,6 @@ class AccessMiddleware(BaseMiddleware):
         user = event.from_user
         if user is None: return await handler(event, data)
 
-        # === МУТ (сначала, чтобы удалять сообщения мучеников) ===
         chat_id = event.chat.id if event.chat else None
         if chat_id and chat_id in MUTED and user.id in MUTED[chat_id]:
             if not is_owner(user):
@@ -591,21 +609,15 @@ class AccessMiddleware(BaseMiddleware):
                 except Exception: pass
                 return
 
-        # === МЕДИА без текста — пропускаем ВСЕГДА без ключа ===
         text = (getattr(event, "text", None) or "").strip()
         if not text:
             return await handler(event, data)
 
         cmd = text.split()[0].lower() if text else ""
-
-        # === Бесплатные команды и dot-команды ===
         if cmd in ALWAYS_FREE: return await handler(event, data)
         if text.startswith(DOT_FREE): return await handler(event, data)
-
-        # === Владелец — пропускаем ===
         if is_owner(user): return await handler(event, data)
 
-        # === Проверка ключа ===
         status = user_status(user.id)
         if status == "valid": return await handler(event, data)
         if status == "expired":
@@ -641,7 +653,6 @@ async def try_activate_key(event, user, key):
                             parse_mode="HTML")
 
 
-# ============ КЛЮЧИ ============
 def owner_reply_kb():
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_CREATE_KEY),
                                           KeyboardButton(text=BTN_KEYS_STATUS)]],
@@ -825,15 +836,20 @@ async def cmd_revoke(message):
     await _do_revoke(message, parts[1] if len(parts) >= 2 else None)
 
 
-# ============ РУЛЕТКА ============
-@dp.message(F.text.func(lambda t: t and t.strip().lower() in (".ruletka", ".rl", "рулетка")))
-async def cmd_ruletka(message):
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".ruletka")))
+async def cmd_ruletka_dot(message):
     await _try_delete_command(message)
     win = random.random() < 5/6
     await message.answer(random.choice(RULETKA_WIN if win else RULETKA_LOSE))
 
 
-# ============ ГОЛОСОВЫЕ (везде) ============
+@dp.message(F.text.func(lambda t: t and t.strip().lower() in (".rl", "рулетка")))
+async def cmd_ruletka_rl(message):
+    await _try_delete_command(message)
+    win = random.random() < 5/6
+    await message.answer(random.choice(RULETKA_WIN if win else RULETKA_LOSE))
+
+
 @dp.message(F.voice)
 async def process_voice(message, state):
     await state.set_state(None); await _handle_stt(message, message.voice.file_id, ".ogg")
@@ -844,7 +860,6 @@ async def process_video_note(message, state):
     await state.set_state(None); await _handle_stt(message, message.video_note.file_id, ".mp4")
 
 
-# ============ SWITCH, TTS (только ЛС) ============
 @dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".switch")))
 async def cmd_switch(message):
     if message.chat.type in ("group", "supergroup", "channel"): return
@@ -889,7 +904,6 @@ async def cmd_tts(message):
             except Exception: pass
 
 
-# ============ СТИКЕРПАКИ (только ЛС) ============
 @dp.message(F.text == "/stickers")
 async def cmd_stickers(message, state):
     if message.chat.type in ("group", "supergroup", "channel"): return
@@ -1039,7 +1053,6 @@ async def process_sticker_add(message, state):
 async def wrong_sticker_add(message): await message.answer("🖼 Картинка.")
 
 
-# ============ ФОТО НАРЕЗКА (только ЛС) ============
 @dp.message(F.document & F.document.mime_type.startswith("image/"))
 async def process_photo_document(message, state):
     if message.chat.type in ("group", "supergroup", "channel"): return
@@ -1121,7 +1134,6 @@ async def execute_splitting(msg_obj, state, pp, n):
         await state.clear()
 
 
-# ============ ССЫЛКИ (только ЛС) ============
 @dp.message(F.text.contains("http://") | F.text.contains("https://"))
 async def ask_type(message, state):
     if message.chat.type in ("group", "supergroup", "channel"): return
@@ -1178,7 +1190,6 @@ async def process_download(cb, state):
         await state.clear()
 
 
-# ============ АУДИО (только ЛС) ============
 @dp.message(F.audio)
 async def process_audio_for_tag(message, state):
     if message.chat.type in ("group", "supergroup", "channel"): return
@@ -1243,7 +1254,6 @@ async def process_meta(message, state):
         await state.clear()
 
 
-# ============ МУТ (unmute ДО mute!) ============
 def _target_from_msg(message):
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
@@ -1281,7 +1291,6 @@ async def cmd_mute(message):
     await message.answer(f"🔇 <b>МОЛЧАТЬ!!!</b> {html_mod.escape(name)}", parse_mode="HTML")
 
 
-# ============ ОБЩИЕ ============
 HELP_TEXT = (
     "📖 <b>Что умею:</b>\n\n"
     "🎲 <code>.ruletka</code> — русская рулетка\n"
@@ -1362,7 +1371,6 @@ async def cmd_whisper(message):
     await message.answer(f"🤫 <code>@{bot_uname} текст @username</code>", parse_mode="HTML")
 
 
-# ============ ШЁПОТ ============
 def _next_whisper_id():
     c = int(DATA.get("whisper_counter", 1)); DATA["whisper_counter"] = c + 1; return c
 
@@ -1436,7 +1444,6 @@ async def cb_whisper_help(cb):
     await cb.answer(f"🤫 @{bot_uname} текст @username", show_alert=True)
 
 
-# ============ БИЗНЕС ============
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
     try:
@@ -1447,15 +1454,6 @@ async def on_business_connection(connection: BusinessConnection):
                 DATA["dead_bc"] = [x for x in DATA["dead_bc"] if x != connection.id]
             save_data(DATA)
             print(f"Business подключён: {connection.id}")
-            try:
-                await bot.send_message(connection.user.id,
-                    "✅ <b>Бот подключён.</b>\n\n"
-                    "<b>Команды:</b>\n"
-                    "• <code>.ttt</code>, <code>.mute</code>, <code>.unmute</code>\n"
-                    "• <code>.switch</code>, <code>.sum</code>, <code>.tts</code>\n"
-                    "• <code>.ruletka</code>, <code>.revoke</code>, <code>.help</code>\n\n"
-                    "🎤 Голосовые — расшифровка.", parse_mode="HTML")
-            except Exception: pass
         else:
             BUSINESS_CONNECTIONS.pop(connection.id, None)
             DATA.get("business_owners", {}).pop(connection.id, None)
@@ -1640,7 +1638,7 @@ async def bc_tts(message):
     except Exception: pass
 
 
-@dp.business_message(F.text.func(lambda t: t and t.strip().lower() in (".ruletka", ".rl")))
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".ruletka")))
 async def bc_ruletka(message):
     try:
         bc = message.business_connection_id
@@ -1672,27 +1670,6 @@ async def bc_revoke(message):
     except Exception: pass
 
 
-# ============ ПОДКЛЮЧЕНИЕ МОДУЛЕЙ ИГР ============
-try:
-    import game_uno
-    print("[games] uno загружен")
-except ImportError as e:
-    print(f"[games] uno НЕ загружен: {e}")
-
-try:
-    import game_mafia
-    print("[games] mafia загружена")
-except ImportError as e:
-    print(f"[games] mafia НЕ загружена: {e}")
-
-try:
-    import game_ttt
-    print("[games] ttt загружен")
-except ImportError as e:
-    print(f"[games] ttt НЕ загружен: {e}")
-
-
-# ============ ЗАПУСК ============
 async def keep_alive():
     while True:
         try:
@@ -1729,6 +1706,24 @@ dp.message.middleware(AccessMiddleware())
 
 async def main():
     global DATA
+
+    # Подключаем игры ТОЛЬКО ЗДЕСЬ, после полной инициализации bot.py
+    try:
+        import game_uno
+        print("[games] uno загружен")
+    except ImportError as e:
+        print(f"[games] uno НЕ загружен: {e}")
+    try:
+        import game_mafia
+        print("[games] mafia загружена")
+    except ImportError as e:
+        print(f"[games] mafia НЕ загружена: {e}")
+    try:
+        import game_ttt
+        print("[games] ttt загружен")
+    except ImportError as e:
+        print(f"[games] ttt НЕ загружен: {e}")
+
     DATA = await load_data_from_tg()
     cleanup_expired_whispers()
     print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}")
