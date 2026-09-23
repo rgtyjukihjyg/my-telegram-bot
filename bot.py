@@ -542,38 +542,41 @@ def other_site_download(url, mode):
     return final, title, info.get("duration"), performer, info.get("thumbnail")
 
 
-# FIX: равномерное распределение остатка по 1 пикселю между частями
+# FIX: картинка чуть сжимается, чтобы делилась ровно; все куски строго одинакового размера
 def split_image(image_path, total_parts):
     img = Image.open(image_path)
     if img.mode != "RGB":
         img = img.convert("RGB")
-    w, h = img.size
+
     cols = 3
     rows = total_parts // cols
 
-    base_w = w // cols
-    rem_w = w % cols
-    widths = [base_w + (1 if i < rem_w else 0) for i in range(cols)]
+    w, h = img.size
 
-    base_h = h // rows
-    rem_h = h % rows
-    heights = [base_h + (1 if i < rem_h else 0) for i in range(rows)]
+    # Размер, который делится на cols и rows без остатка
+    new_w = (w // cols) * cols
+    new_h = (h // rows) * rows
+
+    # Сжимаем максимум на 1-2 пикселя — глазу не видно, зато никаких смещений
+    if new_w != w or new_h != h:
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        w, h = img.size
+        print(f"split: {w}x{h} -> ровная сетка {cols}x{rows}")
+
+    pw = w // cols
+    ph = h // rows
 
     files = []
-    y = 0
     for row in range(rows):
-        x = 0
         for col in range(cols):
-            left = x
-            top = y
-            right = x + widths[col]
-            bottom = y + heights[row]
+            left = col * pw
+            top = row * ph
+            right = left + pw
+            bottom = top + ph
             crop = img.crop((left, top, right, bottom))
             fn = f"temp_photos/part_{row}_{col}.png"
             crop.save(fn, "PNG", optimize=False, compress_level=1)
             files.append(fn)
-            x = right
-        y = bottom
     return files
 
 
@@ -1940,10 +1943,9 @@ async def process_meta(message: Message, state: FSMContext):
 
 
 # ============================================================
-#         ОБРАБОТКА ФОТО (нарезка) — С ФИКСОМ КАЧЕСТВА
+#         ОБРАБОТКА ФОТО (нарезка)
 # ============================================================
 
-# FIX: обработчик документа-картинки (без сжатия Telegram)
 @dp.message(F.document & F.document.mime_type.startswith("image/"))
 async def process_photo_document(message: Message, state: FSMContext):
     d = message.document
@@ -2001,7 +2003,6 @@ async def auto_split(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# FIX: кнопка «Отправить оригинал» без нарезки
 @dp.callback_query(F.data == "send_original", BotStates.waiting_for_parts)
 async def send_original(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
