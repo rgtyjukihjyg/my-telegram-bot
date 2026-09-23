@@ -49,6 +49,13 @@ dp = Dispatcher()
 BOT_USERNAME_CACHE = None
 STT_MODEL = None
 
+# Крестики-нолики: chat_id -> состояние игры
+TTT_GAMES = {}
+# Мут: chat_id -> set(user_id)
+MUTED = {}
+# Business-соединения
+BUSINESS_CONNECTIONS = {}
+
 
 class BotStates(StatesGroup):
     waiting_for_parts = State()
@@ -287,6 +294,7 @@ def user_status(user_id):
 PASSTHROUGH_COMMANDS = {
     "/whoami", "/cancel", "/start", "/mykey", "/help", "/code", "/whisper",
 }
+DOT_COMMANDS = (".ttt", ".mute", ".unmute", ".xo")
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -298,7 +306,24 @@ class AccessMiddleware(BaseMiddleware):
             return await handler(event, data)
         text = (getattr(event, "text", None) or "").strip()
         cmd = text.split()[0].lower() if text else ""
+
+        # Мут: удаляем сообщения замученного
+        chat_id = event.chat.id if event.chat else None
+        if chat_id and chat_id in MUTED and user.id in MUTED[chat_id]:
+            if not is_owner(user):
+                try:
+                    await event.delete()
+                except Exception as e:
+                    print(f"mute delete err: {e}")
+                try:
+                    await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!")
+                except Exception as e:
+                    print(f"mute send err: {e}")
+                return
+
         if cmd in PASSTHROUGH_COMMANDS:
+            return await handler(event, data)
+        if text.startswith(DOT_COMMANDS):
             return await handler(event, data)
         if is_owner(user):
             return await handler(event, data)
@@ -523,7 +548,6 @@ def other_site_download(url, mode):
 
 def split_image(image_path, total_parts):
     img = Image.open(image_path)
-    # Конвертим в RGB, чтобы убрать возможную альфу
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
@@ -540,7 +564,6 @@ def split_image(image_path, total_parts):
             bottom = (row + 1) * ph if row < rows - 1 else h
             crop = img.crop((left, top, right, bottom))
             fn = f"temp_photos/part_{row}_{col}.png"
-            # PNG без потерь, быстрое сжатие
             crop.save(fn, "PNG", optimize=False, compress_level=1)
             files.append(fn)
     return files
@@ -667,6 +690,483 @@ async def _handle_stt(message: Message, file_id: str, ext_hint: str = ".ogg"):
 
 
 # ============================================================
+#                   КРЕСТИКИ-НОЛИКИ
+# ============================================================
+
+TTT_WIN_LINES = [
+    (0, 1, 2), (3, 4, 5), (6, 7, 8),
+    (0, 3, 6), (1, 4, 7), (2, 5, 8),
+    (0, 4, 8), (2, 4, 6),
+]
+
+
+def ttt_board_text(game):
+    board = game["board"]
+    x_name = game["names"].get("x") or "?"
+    o_name = game["names"].get("o") or "ждём игрока..."
+
+    def cell(i):
+        v = board[i]
+        if v == "X":
+            return "❌"
+        if v == "O":
+            return "⭕"
+        return "▫️"
+
+    grid = (
+        f"{cell(0)} {cell(1)} {cell(2)}\n"
+        f"{cell(3)} {cell(4)} {cell(5)}\n"
+        f"{cell(6)} {cell(7)} {cell(8)}"
+    )
+
+    if game.get("finished"):
+        footer = game.get("footer", "")
+    else:
+        footer = f"Ход: {'❌' if game['turn'] == 'x' else '⭕'}"
+
+    return (
+        f"❌⭕ *Крестики-нолики* ❌⭕\n\n"
+        f"❌ {x_name}\n"
+        f"⭕ {o_name}\n\n"
+        f"{grid}\n\n"
+        f"{footer}"
+    )
+
+
+def ttt_keyboard(game):
+    board = game["board"]
+    b = InlineKeyboardBuilder()
+
+    if not game.get("o_id") and not game.get("finished"):
+        b.button(text="🙋 Присоединиться", callback_data="ttt_join")
+        return b.as_markup()
+
+    row = []
+    for i in range(9):
+        if board[i] is None and not game.get("finished"):
+            row.append(InlineKeyboardButton(text="⬜", callback_data=f"ttt_move:{i}"))
+        else:
+            symbol = "❌" if board[i] == "X" else ("⭕" if board[i] == "O" else "⬜")
+            row.append(InlineKeyboardButton(text=symbol, callback_data="ttt_noop"))
+        if len(row) == 3:
+            b.row(*row)
+            row = []
+
+    if game.get("finished"):
+        b.row(InlineKeyboardButton(text="🔄 Начать заново", callback_data="ttt_reset"))
+    else:
+        b.row(InlineKeyboardButton(text="🏳️ Сдаться", callback_data="ttt_reset"))
+
+    return b.as_markup()
+
+
+def ttt_check_winner(board):
+    for a, b, c in TTT_WIN_LINES:
+        if board[a] and board[a] == board[b] == board[c]:
+            return board[a]
+    if all(cell is not None for cell in board):
+        return "draw"
+    return None
+
+
+async def _ttt_refresh(old_message: Message, game: dict, bc_id: str = None):
+    """В бизнес-чате удаляем старое сообщение и шлём новое,
+    в обычном — редактируем."""
+    chat_id = old_message.chat.id
+    text = ttt_board_text(game)
+    kb = ttt_keyboard(game)
+
+    if bc_id:
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=bc_id,
+                message_ids=[old_message.message_id],
+            )
+        except Exception as e:
+            print(f"ttt bc delete err: {e}")
+        try:
+            await bot.send_message(
+                chat_id, text,
+                reply_markup=kb,
+                parse_mode="Markdown",
+                business_connection_id=bc_id,
+            )
+        except Exception as e:
+            print(f"ttt bc send err: {e}")
+    else:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=old_message.message_id,
+                text=text,
+                reply_markup=kb,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"ttt edit err: {e}")
+            try:
+                await bot.send_message(
+                    chat_id, text,
+                    reply_markup=kb,
+                    parse_mode="Markdown",
+                )
+            except Exception as e2:
+                print(f"ttt fallback send err: {e2}")
+
+
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".ttt")))
+async def cmd_ttt(message: Message):
+    chat_id = message.chat.id
+    if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
+        await message.answer("⚠️ Игра уже идёт. Подожди или сдайся.")
+        return
+
+    user = message.from_user
+    name = user.full_name or (f"@{user.username}" if user.username else "Игрок")
+
+    TTT_GAMES[chat_id] = {
+        "board": [None] * 9,
+        "x_id": user.id,
+        "o_id": None,
+        "turn": "x",
+        "names": {"x": name, "o": None},
+        "finished": False,
+        "footer": "",
+    }
+
+    game = TTT_GAMES[chat_id]
+    await message.answer(ttt_board_text(game), reply_markup=ttt_keyboard(game), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "ttt_join")
+async def cb_ttt_join(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    game = TTT_GAMES.get(chat_id)
+    if not game:
+        await cb.answer("Игра не найдена.", show_alert=True)
+        return
+    if game["finished"]:
+        await cb.answer("Игра уже закончена.", show_alert=True)
+        return
+    if game.get("o_id"):
+        await cb.answer("Место занято 🙅", show_alert=True)
+        return
+    if cb.from_user.id == game["x_id"]:
+        await cb.answer("Ты уже играешь за ❌", show_alert=True)
+        return
+
+    user = cb.from_user
+    name = user.full_name or (f"@{user.username}" if user.username else "Игрок")
+    game["o_id"] = user.id
+    game["names"]["o"] = name
+
+    bc_id = game.get("bc_id")
+    await _ttt_refresh(cb.message, game, bc_id)
+    await cb.answer("Погнали! Твой ход вторым.")
+
+
+@dp.callback_query(F.data.startswith("ttt_move:"))
+async def cb_ttt_move(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    game = TTT_GAMES.get(chat_id)
+    if not game:
+        await cb.answer("Игра не найдена.", show_alert=True)
+        return
+    if game["finished"]:
+        await cb.answer("Игра уже закончена.", show_alert=True)
+        return
+    if not game.get("o_id"):
+        await cb.answer("Ещё не все подключились.", show_alert=True)
+        return
+
+    turn = game["turn"]
+    expected_id = game["x_id"] if turn == "x" else game["o_id"]
+    if cb.from_user.id != expected_id:
+        await cb.answer("Сейчас не твой ход 🙃", show_alert=True)
+        return
+
+    try:
+        idx = int(cb.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await cb.answer("Некорректный ход.", show_alert=True)
+        return
+
+    if idx < 0 or idx > 8 or game["board"][idx] is not None:
+        await cb.answer("Клетка занята.", show_alert=True)
+        return
+
+    game["board"][idx] = "X" if turn == "x" else "O"
+
+    winner = ttt_check_winner(game["board"])
+    if winner == "X":
+        game["finished"] = True
+        game["footer"] = f"🏆 *Победа!* ❌ {game['names']['x']}"
+    elif winner == "O":
+        game["finished"] = True
+        game["footer"] = f"🏆 *Победа!* ⭕ {game['names']['o']}"
+    elif winner == "draw":
+        game["finished"] = True
+        game["footer"] = "🤝 *Ничья!*"
+    else:
+        game["turn"] = "o" if turn == "x" else "x"
+
+    bc_id = game.get("bc_id")
+    await _ttt_refresh(cb.message, game, bc_id)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "ttt_reset")
+async def cb_ttt_reset(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    game = TTT_GAMES.get(chat_id)
+    if not game:
+        await cb.answer("Игра не найдена.", show_alert=True)
+        return
+    if cb.from_user.id not in (game["x_id"], game["o_id"]):
+        await cb.answer("Только игроки могут сбросить.", show_alert=True)
+        return
+
+    game["board"] = [None] * 9
+    game["turn"] = "x"
+    game["finished"] = False
+    game["footer"] = ""
+
+    bc_id = game.get("bc_id")
+    await _ttt_refresh(cb.message, game, bc_id)
+    await cb.answer("Поле очищено, ходит ❌")
+
+
+@dp.callback_query(F.data == "ttt_noop")
+async def cb_ttt_noop(cb: CallbackQuery):
+    await cb.answer()
+
+
+# ============================================================
+#                          МУТ
+# ============================================================
+
+def _target_user_from_message(message: Message):
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user
+
+    text = message.text or ""
+    m = re.search(r"@(\w+)", text)
+    if m:
+        uname = m.group(1).lower()
+        for uid, udata in DATA["users"].items():
+            if (udata.get("username") or "").lower() == uname:
+                return type("U", (), {"id": int(uid), "username": uname, "full_name": f"@{uname}"})()
+    return None
+
+
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".mute")))
+async def cmd_mute(message: Message):
+    if not is_owner(message.from_user):
+        await message.answer("Только владелец может мутить.")
+        return
+
+    target = _target_user_from_message(message)
+    if not target:
+        await message.answer(
+            "Кого мутить? Ответь `.mute` на его сообщение, или укажи @username."
+        )
+        return
+    if target.id == message.from_user.id:
+        await message.answer("Себя мутить? Смысл?")
+        return
+    if is_owner(target):
+        await message.answer("Владельца мутить нельзя.")
+        return
+
+    chat_id = message.chat.id
+    MUTED.setdefault(chat_id, set()).add(target.id)
+    name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
+    await message.answer(f"🔇 *МОЛЧАТЬ!!!* {name} в муте.\nСнять — `.unmute` (reply).", parse_mode="Markdown")
+
+
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".unmute")))
+async def cmd_unmute(message: Message):
+    if not is_owner(message.from_user):
+        await message.answer("Только владелец может снимать мут.")
+        return
+
+    target = _target_user_from_message(message)
+    if not target:
+        await message.answer("Ответь `.unmute` на его сообщение, или укажи @username.")
+        return
+
+    chat_id = message.chat.id
+    muted_set = MUTED.get(chat_id, set())
+    if target.id in muted_set:
+        muted_set.discard(target.id)
+        name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
+        await message.answer(f"Так и быть, говори, {name}.")
+    else:
+        await message.answer("Он и так не в муте.")
+
+
+# ============================================================
+#              BUSINESS CHAT (Telegram Business)
+# ============================================================
+
+@dp.business_connection()
+async def on_business_connection(connection):
+    """Следим за подключением/отключением бизнес-бота."""
+    try:
+        if connection.is_enabled:
+            BUSINESS_CONNECTIONS[connection.id] = connection.user.id
+            print(f"Business подключён: {connection.id} -> user {connection.user.id}")
+
+            # Уведомление владельцу в личку
+            try:
+                await bot.send_message(
+                    connection.user.id,
+                    "✅ Бот успешно подключён к аккаунту.\n\n"
+                    "📖 Доступные команды в бизнес-чате:\n"
+                    "• `.ttt` — крестики-нолики\n"
+                    "• `.mute` — замутить собеседника (ответом на его сообщение)\n"
+                    "• `.unmute` — снять мут\n\n"
+                    "⚠️ Команды работают только в личке этого аккаунта."
+                )
+            except Exception as e:
+                print(f"business notify err: {e}")
+        else:
+            BUSINESS_CONNECTIONS.pop(connection.id, None)
+            print(f"Business отключён: {connection.id}")
+    except Exception as e:
+        print(f"business_connection err: {e}")
+
+
+# ---------------- .ttt в Business Chat ----------------
+
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".ttt")))
+async def bc_cmd_ttt(message: Message):
+    chat_id = message.chat.id
+    bc_id = message.business_connection_id
+
+    if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
+        await bot.send_message(
+            chat_id, "⚠️ Игра уже идёт.", business_connection_id=bc_id,
+        )
+        return
+
+    user = message.from_user
+    name = user.full_name or (f"@{user.username}" if user.username else "Игрок")
+
+    TTT_GAMES[chat_id] = {
+        "board": [None] * 9,
+        "x_id": user.id,
+        "o_id": None,
+        "turn": "x",
+        "names": {"x": name, "o": None},
+        "finished": False,
+        "footer": "",
+        "bc_id": bc_id,
+    }
+
+    game = TTT_GAMES[chat_id]
+    await bot.send_message(
+        chat_id,
+        ttt_board_text(game),
+        reply_markup=ttt_keyboard(game),
+        parse_mode="Markdown",
+        business_connection_id=bc_id,
+    )
+
+
+# ---------------- .mute / .unmute в Business Chat ----------------
+
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".mute")))
+async def bc_cmd_mute(message: Message):
+    bc_id = message.business_connection_id
+    if not is_owner(message.from_user):
+        await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
+        return
+
+    target = _target_user_from_message(message)
+    if not target:
+        await bot.send_message(
+            message.chat.id,
+            "Ответь `.mute` на сообщение жертвы, или укажи @username.",
+            business_connection_id=bc_id,
+        )
+        return
+
+    chat_id = message.chat.id
+    MUTED.setdefault(chat_id, set()).add(target.id)
+    name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
+    await bot.send_message(
+        chat_id,
+        f"🔇 *МОЛЧАТЬ!!!* {name} в муте.",
+        parse_mode="Markdown",
+        business_connection_id=bc_id,
+    )
+
+
+@dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".unmute")))
+async def bc_cmd_unmute(message: Message):
+    bc_id = message.business_connection_id
+    if not is_owner(message.from_user):
+        await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
+        return
+
+    target = _target_user_from_message(message)
+    if not target:
+        await bot.send_message(
+            message.chat.id,
+            "Укажи @username.",
+            business_connection_id=bc_id,
+        )
+        return
+
+    chat_id = message.chat.id
+    muted_set = MUTED.get(chat_id, set())
+    if target.id in muted_set:
+        muted_set.discard(target.id)
+        name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
+        await bot.send_message(
+            chat_id,
+            f"Так и быть, говори, {name}.",
+            business_connection_id=bc_id,
+        )
+    else:
+        await bot.send_message(
+            chat_id,
+            "Он и так не в муте.",
+            business_connection_id=bc_id,
+        )
+
+
+# ---------------- Мут: удаление бизнес-сообщений ----------------
+
+@dp.business_message()
+async def bc_mute_enforcer(message: Message):
+    chat_id = message.chat.id
+    user = message.from_user
+    if not user:
+        return
+    if chat_id in MUTED and user.id in MUTED[chat_id]:
+        if is_owner(user):
+            return
+        bc_id = message.business_connection_id
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=bc_id,
+                message_ids=[message.message_id],
+            )
+        except Exception as e:
+            print(f"bc mute delete err: {e}")
+        try:
+            await bot.send_message(
+                chat_id,
+                "🔇 МОЛЧАТЬ!!!",
+                business_connection_id=bc_id,
+            )
+        except Exception as e:
+            print(f"bc mute send err: {e}")
+
+
+# ============================================================
 #                         HANDLERS
 # ============================================================
 
@@ -691,13 +1191,6 @@ async def cmd_start(message: Message):
         "🎤 Голосовое — расшифровываю в текст\n"
         "🎨 Стикерпаки — собираю твои стикеры\n"
         f"🤫 Шёпот — в чате напиши `@{bot_uname} текст @username`\n\n"
-        "📖 Команды:\n"
-        "/help — помощь\n"
-        "/stickers — стикерпаки\n"
-        "/whisper — как отправить шёпот\n"
-        "/mykey — мой ключ\n"
-        "/code — активировать ключ\n"
-        "/cancel — отменить действие\n\n"
         "🔑 Отправь /code ТВОЙ_КЛЮЧ, чтобы начать."
     )
     if is_owner(message.from_user):
@@ -776,12 +1269,18 @@ async def cmd_keys(message: Message):
     await _send_keys_list(message)
 
 
-# --- Reply-кнопки владельца (толерантные к эмодзи) ---
+def _text_has(text, *words):
+    if not text:
+        return False
+    tl = text.lower()
+    return all(w.lower() in tl for w in words)
 
-@dp.message(F.text.contains("Создать ключ"))
+
+@dp.message(F.text.func(lambda t: _text_has(t, "создать", "ключ")))
 async def btn_newkey(message: Message):
-    print(f"btn_newkey: text={message.text!r}")
+    print(f"btn_newkey HIT: text={message.text!r}")
     if not is_owner(message.from_user):
+        await message.answer("Только для владельца.")
         return
     b = InlineKeyboardBuilder()
     b.button(text="♾ Навсегда", callback_data="newkey_perm")
@@ -789,10 +1288,11 @@ async def btn_newkey(message: Message):
     await message.answer("❓ Какой ключ делаем?", reply_markup=b.as_markup())
 
 
-@dp.message(F.text.contains("Статусы ключей"))
+@dp.message(F.text.func(lambda t: _text_has(t, "статус")))
 async def btn_keys(message: Message):
-    print(f"btn_keys: text={message.text!r}")
+    print(f"btn_keys HIT: text={message.text!r}")
     if not is_owner(message.from_user):
+        await message.answer("Только для владельца.")
         return
     await _send_keys_list(message)
 
@@ -1488,7 +1988,6 @@ async def execute_splitting(msg_obj, state, pp, n):
         loop = asyncio.get_event_loop()
         parts = await loop.run_in_executor(None, split_image, pp, n)
 
-        # Числовая сортировка: (row, col). part_0_0, part_0_1, part_0_2, part_1_0, ...
         def sort_key(path):
             m = re.search(r'part_(\d+)_(\d+)', path)
             if m:
@@ -1499,7 +1998,6 @@ async def execute_splitting(msg_obj, state, pp, n):
         total = len(parts)
         print(f"split: {total} частей, порядок: {[os.path.basename(p) for p in parts[:6]]}...")
 
-        # Отправляем как ДОКУМЕНТЫ в PNG — без сжатия Telegram
         for i, pf in enumerate(parts):
             if not os.path.exists(pf):
                 continue
@@ -1510,7 +2008,6 @@ async def execute_splitting(msg_obj, state, pp, n):
             )
             await asyncio.sleep(0.4)
 
-        # Удаляем временные файлы
         for pf in parts:
             if os.path.exists(pf):
                 try:
