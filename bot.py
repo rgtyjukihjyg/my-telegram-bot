@@ -18,6 +18,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     BufferedInputFile, InputSticker, BotCommand,
     MenuButtonCommands, InputMediaPhoto,
+    BusinessConnection,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -65,6 +66,7 @@ STT_MODEL = None
 TTT_GAMES = {}
 MUTED = {}
 BUSINESS_CONNECTIONS = {}
+DEAD_BC_NOTIFIED = set()
 
 WHISPER_TTL = 86400
 
@@ -109,7 +111,7 @@ def _empty_data():
     return {
         "keys": {}, "users": {}, "sticker_packs": {},
         "whispers": {}, "whisper_counter": 1,
-        "business_owners": {},  # bc_id -> user_id владельца
+        "business_owners": {},
     }
 
 
@@ -365,49 +367,67 @@ def cleanup_expired_whispers():
 
 def _is_peer_invalid(err: Exception) -> bool:
     s = str(err)
-    return "BUSINESS_PEER_INVALID" in s or "business connection" in s.lower()
+    return "BUSINESS_PEER_INVALID" in s
+
+
+def _is_peer_usage_missing(err: Exception) -> bool:
+    s = str(err)
+    return "BUSINESS_PEER_USAGE_MISSING" in s
+
+
+async def _check_business_connection(bc_id: str) -> bool:
+    """Проверяет, активно ли бизнес-соединение."""
+    entry = BUSINESS_CONNECTIONS.get(bc_id)
+    if entry and entry.get("is_enabled", True):
+        return True
+    return False
 
 
 async def _notify_owner_bc_dead(bc_id: str, chat_id: int = None):
-    """Сообщает владельцу бизнес-подключения, что оно устарело."""
+    """Сообщает владельцу (или самому боту-владельцу) что bc_id умер."""
+    if bc_id in DEAD_BC_NOTIFIED:
+        if chat_id:
+            if chat_id in TTT_GAMES and TTT_GAMES[chat_id].get("bc_id") == bc_id:
+                TTT_GAMES.pop(chat_id, None)
+            MUTED.pop(chat_id, None)
+        return
+
     owner_id = None
 
-    # сначала из кэша памяти
-    if bc_id in BUSINESS_CONNECTIONS:
-        owner_id = BUSINESS_CONNECTIONS[bc_id].get("user_id") if isinstance(
-            BUSINESS_CONNECTIONS[bc_id], dict) else BUSINESS_CONNECTIONS[bc_id]
-
-    # потом из DATA
-    if not owner_id:
-        bo = DATA.get("business_owners", {})
-        owner_id = bo.get(bc_id)
+    bc_entry = BUSINESS_CONNECTIONS.get(bc_id)
+    if bc_entry and isinstance(bc_entry, dict):
+        owner_id = bc_entry.get("user_id")
 
     if not owner_id:
-        print(f"[bc] не смог определить владельца bc_id={bc_id}")
-        return
+        owner_id = DATA.get("business_owners", {}).get(bc_id)
+
+    if not owner_id:
+        owner_id = OWNER_ID
+        print(f"[bc] bc_id={bc_id} неизвестен, шлю уведомление OWNER_ID={OWNER_ID}")
+
+    DEAD_BC_NOTIFIED.add(bc_id)
 
     try:
         await bot.send_message(
             owner_id,
             "⚠️ <b>Бизнес-подключение устарело</b>\n\n"
-            "Telegram сбросил соединение бота с твоим Business-аккаунтом. "
-            "Из-за этого команды в бизнес-чатах (например <code>.ttt</code>, "
-            "<code>.mute</code>) больше не работают.\n\n"
+            f"ID: <code>{html_mod.escape(bc_id[:24])}...</code>\n\n"
+            "Telegram сбросил соединение бота с Business-аккаунтом. "
+            "Команды в бизнес-чатах (<code>.ttt</code>, <code>.mute</code> и т.п.) "
+            "больше не работают в этом чате.\n\n"
             "🔧 <b>Как починить:</b>\n"
             "1. Telegram → <b>Настройки</b>\n"
             "2. <b>Telegram Business</b> → <b>Чат-боты</b>\n"
             "3. Удали этого бота и добавь заново\n\n"
-            "После этого всё заработает.",
+            "После переподключения всё заработает.",
             parse_mode="HTML",
         )
     except Exception as e:
-        print(f"[bc] не смог уведомить владельца {owner_id}: {str(e)[:150]}")
+        print(f"[bc] не смог уведомить {owner_id}: {str(e)[:150]}")
 
-    # забываем bc_id из кэша
     BUSINESS_CONNECTIONS.pop(bc_id, None)
     DATA.get("business_owners", {}).pop(bc_id, None)
 
-    # чистим игры/муты этого чата
     if chat_id:
         if chat_id in TTT_GAMES and TTT_GAMES[chat_id].get("bc_id") == bc_id:
             TTT_GAMES.pop(chat_id, None)
@@ -1254,6 +1274,9 @@ async def _ttt_refresh(old_message: Message, game: dict, bc_id: str = None):
     kb = ttt_keyboard(game)
 
     if bc_id:
+        if not await _check_business_connection(bc_id):
+            await _notify_owner_bc_dead(bc_id, chat_id)
+            return
         try:
             await bot.delete_business_messages(
                 business_connection_id=bc_id,
@@ -1456,10 +1479,14 @@ async def cmd_unmute(message: Message):
 # ============================================================
 
 @dp.business_connection()
-async def on_business_connection(connection):
+async def on_business_connection(connection: BusinessConnection):
     try:
         if connection.is_enabled:
-            BUSINESS_CONNECTIONS[connection.id] = {"user_id": connection.user.id}
+            BUSINESS_CONNECTIONS[connection.id] = {
+                "user_id": connection.user.id,
+                "is_enabled": True,
+                "can_reply": getattr(connection, "can_reply", True),
+            }
             DATA.setdefault("business_owners", {})[connection.id] = connection.user.id
             save_data(DATA)
             print(f"Business подключён: {connection.id} -> user {connection.user.id}")
@@ -1493,6 +1520,9 @@ async def bc_cmd_ttt(message: Message):
     try:
         chat_id = message.chat.id
         bc_id = message.business_connection_id
+        if not await _check_business_connection(bc_id):
+            await _notify_owner_bc_dead(bc_id, chat_id)
+            return
         if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
             try:
                 await bot.send_message(chat_id, "⚠️ Игра уже идёт.", business_connection_id=bc_id)
@@ -1523,6 +1553,9 @@ async def bc_cmd_ttt(message: Message):
 async def bc_cmd_mute(message: Message):
     try:
         bc_id = message.business_connection_id
+        if not await _check_business_connection(bc_id):
+            await _notify_owner_bc_dead(bc_id, message.chat.id)
+            return
         if not is_owner(message.from_user):
             try:
                 await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
@@ -1556,6 +1589,9 @@ async def bc_cmd_mute(message: Message):
 async def bc_cmd_unmute(message: Message):
     try:
         bc_id = message.business_connection_id
+        if not await _check_business_connection(bc_id):
+            await _notify_owner_bc_dead(bc_id, message.chat.id)
+            return
         if not is_owner(message.from_user):
             try:
                 await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
@@ -1601,6 +1637,9 @@ async def bc_mute_enforcer(message: Message):
                 return
             bc_id = message.business_connection_id
             if not bc_id:
+                return
+            if not await _check_business_connection(bc_id):
+                await _notify_owner_bc_dead(bc_id, chat_id)
                 return
             try:
                 await bot.delete_business_messages(
