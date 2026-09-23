@@ -296,6 +296,17 @@ def cleanup_expired_whispers():
         print(f"whispers cleanup: удалено {len(expired)} просроченных")
 
 
+def _cleanup_dead_business(chat_id: int, bc_id: str):
+    """Убирает мёртвые игры/муты при BUSINESS_PEER_INVALID."""
+    if chat_id in TTT_GAMES and TTT_GAMES[chat_id].get("bc_id") == bc_id:
+        TTT_GAMES.pop(chat_id, None)
+    MUTED.pop(chat_id, None)
+
+
+def _is_peer_invalid(err: Exception) -> bool:
+    return "BUSINESS_PEER_INVALID" in str(err)
+
+
 PASSTHROUGH_COMMANDS = {
     "/whoami", "/cancel", "/start", "/mykey", "/help", "/code", "/whisper", "/revoke",
 }
@@ -657,7 +668,6 @@ def _generate_key() -> str:
 
 
 def _key_status_text(kd: dict) -> str:
-    """Красивое описание статуса одного ключа (HTML-safe)."""
     if kd.get("used_by"):
         u = DATA["users"].get(str(kd["used_by"]), {})
         uname = u.get("username") or f"id{kd['used_by']}"
@@ -675,7 +685,6 @@ def _key_status_text(kd: dict) -> str:
 
 
 def _render_keys_list():
-    """Возвращает (text, inline_keyboard или None). HTML."""
     keys = DATA["keys"]
     if not keys:
         return "🗂 Пока ни одного ключа нет.", None
@@ -1136,20 +1145,40 @@ async def _ttt_refresh(old_message: Message, game: dict, bc_id: str = None):
     chat_id = old_message.chat.id
     text = ttt_board_text(game)
     kb = ttt_keyboard(game)
+
     if bc_id:
         try:
-            await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[old_message.message_id])
+            await bot.delete_business_messages(
+                business_connection_id=bc_id,
+                message_ids=[old_message.message_id],
+            )
         except Exception as e:
-            print(f"ttt bc delete err: {e}")
+            err = str(e)
+            print(f"ttt bc delete err: {err[:200]}")
+            if _is_peer_invalid(e):
+                _cleanup_dead_business(chat_id, bc_id)
+                return
         try:
-            await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML",
-                                   business_connection_id=bc_id)
+            await bot.send_message(
+                chat_id, text,
+                reply_markup=kb,
+                parse_mode="HTML",
+                business_connection_id=bc_id,
+            )
         except Exception as e:
-            print(f"ttt bc send err: {e}")
+            err = str(e)
+            print(f"ttt bc send err: {err[:200]}")
+            if _is_peer_invalid(e):
+                _cleanup_dead_business(chat_id, bc_id)
     else:
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=old_message.message_id,
-                                        text=text, reply_markup=kb, parse_mode="HTML")
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=old_message.message_id,
+                text=text,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
         except Exception as e:
             print(f"ttt edit err: {e}")
             try:
@@ -1337,86 +1366,155 @@ async def on_business_connection(connection):
                     parse_mode="HTML",
                 )
             except Exception as e:
-                print(f"business notify err: {e}")
+                print(f"business notify err: {str(e)[:200]}")
         else:
             BUSINESS_CONNECTIONS.pop(connection.id, None)
+            for cid, game in list(TTT_GAMES.items()):
+                if game.get("bc_id") == connection.id:
+                    TTT_GAMES.pop(cid, None)
+            print(f"Business отключён: {connection.id}")
     except Exception as e:
-        print(f"business_connection err: {e}")
+        print(f"business_connection err: {str(e)[:200]}")
 
 
 @dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".ttt")))
 async def bc_cmd_ttt(message: Message):
-    chat_id = message.chat.id
-    bc_id = message.business_connection_id
-    if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
-        await bot.send_message(chat_id, "⚠️ Игра уже идёт.", business_connection_id=bc_id)
-        return
-    user = message.from_user
-    name = user.full_name or (f"@{user.username}" if user.username else "Игрок")
-    TTT_GAMES[chat_id] = {
-        "board": [None] * 9, "x_id": user.id, "o_id": None, "turn": "x",
-        "names": {"x": name, "o": None}, "finished": False, "footer": "", "bc_id": bc_id,
-    }
-    await bot.send_message(chat_id, ttt_board_text(TTT_GAMES[chat_id]),
-                           reply_markup=ttt_keyboard(TTT_GAMES[chat_id]),
-                           parse_mode="HTML", business_connection_id=bc_id)
+    try:
+        chat_id = message.chat.id
+        bc_id = message.business_connection_id
+        if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
+            try:
+                await bot.send_message(chat_id, "⚠️ Игра уже идёт.", business_connection_id=bc_id)
+            except Exception:
+                pass
+            return
+        user = message.from_user
+        name = user.full_name or (f"@{user.username}" if user.username else "Игрок")
+        TTT_GAMES[chat_id] = {
+            "board": [None] * 9, "x_id": user.id, "o_id": None, "turn": "x",
+            "names": {"x": name, "o": None}, "finished": False, "footer": "", "bc_id": bc_id,
+        }
+        await bot.send_message(
+            chat_id, ttt_board_text(TTT_GAMES[chat_id]),
+            reply_markup=ttt_keyboard(TTT_GAMES[chat_id]),
+            parse_mode="HTML", business_connection_id=bc_id,
+        )
+    except Exception as e:
+        err = str(e)
+        print(f"bc_cmd_ttt err: {err[:200]}")
+        if _is_peer_invalid(e):
+            _cleanup_dead_business(message.chat.id, message.business_connection_id)
 
 
 @dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".mute")))
 async def bc_cmd_mute(message: Message):
-    bc_id = message.business_connection_id
-    if not is_owner(message.from_user):
-        await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
-        return
-    target = _target_user_from_message(message)
-    if not target:
-        await bot.send_message(message.chat.id, "Ответь `.mute` на сообщение жертвы.",
-                               business_connection_id=bc_id)
-        return
-    MUTED.setdefault(message.chat.id, set()).add(target.id)
-    name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
-    await bot.send_message(message.chat.id, f"🔇 <b>МОЛЧАТЬ!!!</b> {html_mod.escape(name)} в муте.",
-                           parse_mode="HTML", business_connection_id=bc_id)
+    try:
+        bc_id = message.business_connection_id
+        if not is_owner(message.from_user):
+            try:
+                await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
+            except Exception:
+                pass
+            return
+        target = _target_user_from_message(message)
+        if not target:
+            try:
+                await bot.send_message(message.chat.id, "Ответь `.mute` на сообщение жертвы.",
+                                       business_connection_id=bc_id)
+            except Exception:
+                pass
+            return
+        MUTED.setdefault(message.chat.id, set()).add(target.id)
+        name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
+        try:
+            await bot.send_message(message.chat.id, f"🔇 <b>МОЛЧАТЬ!!!</b> {html_mod.escape(name)} в муте.",
+                                   parse_mode="HTML", business_connection_id=bc_id)
+        except Exception as e:
+            err = str(e)
+            print(f"bc mute reply err: {err[:200]}")
+            if _is_peer_invalid(e):
+                _cleanup_dead_business(message.chat.id, bc_id)
+    except Exception as e:
+        print(f"bc_cmd_mute err: {str(e)[:200]}")
 
 
 @dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".unmute")))
 async def bc_cmd_unmute(message: Message):
-    bc_id = message.business_connection_id
-    if not is_owner(message.from_user):
-        await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
-        return
-    target = _target_user_from_message(message)
-    if not target:
-        await bot.send_message(message.chat.id, "Укажи @username.", business_connection_id=bc_id)
-        return
-    muted_set = MUTED.get(message.chat.id, set())
-    if target.id in muted_set:
-        muted_set.discard(target.id)
-        name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
-        await bot.send_message(message.chat.id, f"Так и быть, говори, {html_mod.escape(name)}.",
-                               business_connection_id=bc_id)
-    else:
-        await bot.send_message(message.chat.id, "Он и так не в муте.", business_connection_id=bc_id)
+    try:
+        bc_id = message.business_connection_id
+        if not is_owner(message.from_user):
+            try:
+                await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
+            except Exception:
+                pass
+            return
+        target = _target_user_from_message(message)
+        if not target:
+            try:
+                await bot.send_message(message.chat.id, "Укажи @username.", business_connection_id=bc_id)
+            except Exception:
+                pass
+            return
+        muted_set = MUTED.get(message.chat.id, set())
+        if target.id in muted_set:
+            muted_set.discard(target.id)
+            name = target.full_name or (f"@{target.username}" if target.username else str(target.id))
+            try:
+                await bot.send_message(message.chat.id, f"Так и быть, говори, {html_mod.escape(name)}.",
+                                       business_connection_id=bc_id)
+            except Exception as e:
+                err = str(e)
+                print(f"bc unmute reply err: {err[:200]}")
+                if _is_peer_invalid(e):
+                    _cleanup_dead_business(message.chat.id, bc_id)
+        else:
+            try:
+                await bot.send_message(message.chat.id, "Он и так не в муте.", business_connection_id=bc_id)
+            except Exception as e:
+                err = str(e)
+                print(f"bc unmute reply err: {err[:200]}")
+                if _is_peer_invalid(e):
+                    _cleanup_dead_business(message.chat.id, bc_id)
+    except Exception as e:
+        print(f"bc_cmd_unmute err: {str(e)[:200]}")
 
 
 @dp.business_message()
 async def bc_mute_enforcer(message: Message):
-    chat_id = message.chat.id
-    user = message.from_user
-    if not user:
-        return
-    if chat_id in MUTED and user.id in MUTED[chat_id]:
-        if is_owner(user):
+    try:
+        chat_id = message.chat.id
+        user = message.from_user
+        if not user:
             return
-        bc_id = message.business_connection_id
-        try:
-            await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[message.message_id])
-        except Exception as e:
-            print(f"bc mute delete err: {e}")
-        try:
-            await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!", business_connection_id=bc_id)
-        except Exception as e:
-            print(f"bc mute send err: {e}")
+        if chat_id in MUTED and user.id in MUTED[chat_id]:
+            if is_owner(user):
+                return
+            bc_id = message.business_connection_id
+            if not bc_id:
+                return
+            try:
+                await bot.delete_business_messages(
+                    business_connection_id=bc_id,
+                    message_ids=[message.message_id],
+                )
+            except Exception as e:
+                err = str(e)
+                print(f"bc mute delete err: {err[:200]}")
+                if _is_peer_invalid(e):
+                    _cleanup_dead_business(chat_id, bc_id)
+                return
+            try:
+                await bot.send_message(
+                    chat_id, "🔇 МОЛЧАТЬ!!!",
+                    business_connection_id=bc_id,
+                )
+            except Exception as e:
+                err = str(e)
+                print(f"bc mute send err: {err[:200]}")
+                if _is_peer_invalid(e):
+                    _cleanup_dead_business(chat_id, bc_id)
+    except Exception as e:
+        print(f"bc_mute_enforcer err: {str(e)[:200]}")
 
 
 # ============================================================
