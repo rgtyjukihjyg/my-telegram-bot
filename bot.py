@@ -45,7 +45,6 @@ DATA_FILE = "data.json"
 KEY_LENGTH = 12
 KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-# --- Настройка сессии с увеличенными таймаутами и прокси ---
 _proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
 _session_kwargs = {"timeout": 60}
 if _proxy:
@@ -107,11 +106,14 @@ FUNNY_REPLIES = [
 
 
 def _empty_data():
-    return {"keys": {}, "users": {}, "sticker_packs": {}, "whispers": {}, "whisper_counter": 1}
+    return {
+        "keys": {}, "users": {}, "sticker_packs": {},
+        "whispers": {}, "whisper_counter": 1,
+        "business_owners": {},  # bc_id -> user_id владельца
+    }
 
 
 def _validate_data(d):
-    """Приводит структуру к ожидаемому виду, добавляет недостающие ключи."""
     if not isinstance(d, dict):
         return _empty_data()
     d.setdefault("keys", {})
@@ -119,11 +121,11 @@ def _validate_data(d):
     d.setdefault("sticker_packs", {})
     d.setdefault("whispers", {})
     d.setdefault("whisper_counter", 1)
+    d.setdefault("business_owners", {})
     return d
 
 
 def load_data_from_file():
-    """Читает локальный файл, при проблемах пробует .bak."""
     for path in (DATA_FILE, DATA_FILE + ".bak"):
         if os.path.exists(path):
             try:
@@ -138,7 +140,6 @@ def load_data_from_file():
 
 
 def save_data_to_file(data):
-    """Сохраняет, делает backup предыдущего."""
     try:
         if os.path.exists(DATA_FILE):
             try:
@@ -154,7 +155,6 @@ def save_data_to_file(data):
 
 
 async def _tg_api_get(url, params=None, timeout=30):
-    """Обёртка над GET к Telegram API с retry."""
     import aiohttp
     last_err = None
     for attempt in range(3):
@@ -165,14 +165,13 @@ async def _tg_api_get(url, params=None, timeout=30):
                     return await r.json()
         except Exception as e:
             last_err = e
-            print(f"_tg_api_get attempt {attempt+1}: {e}")
+            print(f"_tg_api_get attempt {attempt+1}: {str(e)[:150]}")
             if attempt < 2:
                 await asyncio.sleep(2)
     raise last_err if last_err else RuntimeError("get failed")
 
 
 async def _tg_download_file(url, timeout=60):
-    """Скачивает файл из Telegram с retry."""
     import aiohttp
     last_err = None
     for attempt in range(3):
@@ -183,22 +182,19 @@ async def _tg_download_file(url, timeout=60):
                     return await r.read()
         except Exception as e:
             last_err = e
-            print(f"_tg_download_file attempt {attempt+1}: {e}")
+            print(f"_tg_download_file attempt {attempt+1}: {str(e)[:150]}")
             if attempt < 2:
                 await asyncio.sleep(2)
     raise last_err if last_err else RuntimeError("download failed")
 
 
 async def load_data_from_tg():
-    """Загружает данные из закреплённого файла в storage-чате.
-    При любой ошибке — fallback на локальный файл + .bak."""
     if not STORAGE_CHAT_ID:
         print("STORAGE_CHAT_ID не задан, читаю из файла")
         return load_data_from_file()
 
     for attempt in range(4):
         try:
-            # 1. getChat
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
             resp = await _tg_api_get(url, params={"chat_id": STORAGE_CHAT_ID})
             if not resp.get("ok"):
@@ -212,7 +208,6 @@ async def load_data_from_tg():
 
             file_id = pinned["document"]["file_id"]
 
-            # 2. getFile
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
             fdata = await _tg_api_get(url, params={"file_id": file_id})
             if not fdata.get("ok"):
@@ -220,8 +215,6 @@ async def load_data_from_tg():
                 break
 
             file_path = fdata["result"]["file_path"]
-
-            # 3. Скачиваем содержимое
             url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
             content = await _tg_download_file(url)
 
@@ -233,7 +226,7 @@ async def load_data_from_tg():
             return d
 
         except Exception as e:
-            print(f"load_data_from_tg attempt {attempt+1} err: {e}")
+            print(f"load_data_from_tg attempt {attempt+1} err: {str(e)[:150]}")
             if attempt < 3:
                 await asyncio.sleep(3 * (attempt + 1))
 
@@ -242,7 +235,6 @@ async def load_data_from_tg():
 
 
 async def save_data_to_tg(data):
-    """Сохраняет в storage-чат. Тихо логирует ошибки, не роняет бота."""
     save_data_to_file(data)
     if not STORAGE_CHAT_ID:
         return
@@ -371,14 +363,55 @@ def cleanup_expired_whispers():
         print(f"whispers cleanup: удалено {len(expired)} просроченных")
 
 
-def _cleanup_dead_business(chat_id: int, bc_id: str):
-    if chat_id in TTT_GAMES and TTT_GAMES[chat_id].get("bc_id") == bc_id:
-        TTT_GAMES.pop(chat_id, None)
-    MUTED.pop(chat_id, None)
-
-
 def _is_peer_invalid(err: Exception) -> bool:
-    return "BUSINESS_PEER_INVALID" in str(err)
+    s = str(err)
+    return "BUSINESS_PEER_INVALID" in s or "business connection" in s.lower()
+
+
+async def _notify_owner_bc_dead(bc_id: str, chat_id: int = None):
+    """Сообщает владельцу бизнес-подключения, что оно устарело."""
+    owner_id = None
+
+    # сначала из кэша памяти
+    if bc_id in BUSINESS_CONNECTIONS:
+        owner_id = BUSINESS_CONNECTIONS[bc_id].get("user_id") if isinstance(
+            BUSINESS_CONNECTIONS[bc_id], dict) else BUSINESS_CONNECTIONS[bc_id]
+
+    # потом из DATA
+    if not owner_id:
+        bo = DATA.get("business_owners", {})
+        owner_id = bo.get(bc_id)
+
+    if not owner_id:
+        print(f"[bc] не смог определить владельца bc_id={bc_id}")
+        return
+
+    try:
+        await bot.send_message(
+            owner_id,
+            "⚠️ <b>Бизнес-подключение устарело</b>\n\n"
+            "Telegram сбросил соединение бота с твоим Business-аккаунтом. "
+            "Из-за этого команды в бизнес-чатах (например <code>.ttt</code>, "
+            "<code>.mute</code>) больше не работают.\n\n"
+            "🔧 <b>Как починить:</b>\n"
+            "1. Telegram → <b>Настройки</b>\n"
+            "2. <b>Telegram Business</b> → <b>Чат-боты</b>\n"
+            "3. Удали этого бота и добавь заново\n\n"
+            "После этого всё заработает.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        print(f"[bc] не смог уведомить владельца {owner_id}: {str(e)[:150]}")
+
+    # забываем bc_id из кэша
+    BUSINESS_CONNECTIONS.pop(bc_id, None)
+    DATA.get("business_owners", {}).pop(bc_id, None)
+
+    # чистим игры/муты этого чата
+    if chat_id:
+        if chat_id in TTT_GAMES and TTT_GAMES[chat_id].get("bc_id") == bc_id:
+            TTT_GAMES.pop(chat_id, None)
+        MUTED.pop(chat_id, None)
 
 
 PASSTHROUGH_COMMANDS = {
@@ -403,11 +436,11 @@ class AccessMiddleware(BaseMiddleware):
                 try:
                     await event.delete()
                 except Exception as e:
-                    print(f"mute delete err: {e}")
+                    print(f"mute delete err: {str(e)[:150]}")
                 try:
                     await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!")
                 except Exception as e:
-                    print(f"mute send err: {e}")
+                    print(f"mute send err: {str(e)[:150]}")
                 return
 
         if cmd in PASSTHROUGH_COMMANDS:
@@ -425,7 +458,7 @@ class AccessMiddleware(BaseMiddleware):
             try:
                 await event.answer("⏰ Срок действия ключа истёк. Введи новый через /code.")
             except Exception as e:
-                print(f"expired send err: {e}")
+                print(f"expired send err: {str(e)[:150]}")
             return
 
         try:
@@ -436,7 +469,7 @@ class AccessMiddleware(BaseMiddleware):
                 "Если уже активировал — /mykey покажет статус."
             )
         except Exception as e:
-            print(f"BLOCKED send err: {e}")
+            print(f"BLOCKED send err: {str(e)[:150]}")
 
 
 async def try_activate_key(event, user, key):
@@ -801,7 +834,7 @@ async def _send_keys_list(message: Message):
         else:
             await message.answer(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        print(f"[key] html send err: {e}")
+        print(f"[key] html send err: {str(e)[:150]}")
         try:
             plain = re.sub(r"<[^>]+>", "", text)
             if kb is None:
@@ -809,7 +842,7 @@ async def _send_keys_list(message: Message):
             else:
                 await message.answer(plain, reply_markup=kb)
         except Exception as e2:
-            print(f"[key] plain send err: {e2}")
+            print(f"[key] plain send err: {str(e2)[:150]}")
             await message.answer(f"❌ Не смог отправить список: {e2}")
 
 
@@ -983,7 +1016,7 @@ async def cb_key_delete(cb: CallbackQuery):
         else:
             await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        print(f"[key] refresh err: {e}")
+        print(f"[key] refresh err: {str(e)[:150]}")
 
 
 async def _do_revoke(message: Message, arg: str = None):
@@ -1230,7 +1263,7 @@ async def _ttt_refresh(old_message: Message, game: dict, bc_id: str = None):
             err = str(e)
             print(f"ttt bc delete err: {err[:200]}")
             if _is_peer_invalid(e):
-                _cleanup_dead_business(chat_id, bc_id)
+                await _notify_owner_bc_dead(bc_id, chat_id)
                 return
         try:
             await bot.send_message(
@@ -1243,7 +1276,7 @@ async def _ttt_refresh(old_message: Message, game: dict, bc_id: str = None):
             err = str(e)
             print(f"ttt bc send err: {err[:200]}")
             if _is_peer_invalid(e):
-                _cleanup_dead_business(chat_id, bc_id)
+                await _notify_owner_bc_dead(bc_id, chat_id)
     else:
         try:
             await bot.edit_message_text(
@@ -1254,11 +1287,11 @@ async def _ttt_refresh(old_message: Message, game: dict, bc_id: str = None):
                 parse_mode="HTML",
             )
         except Exception as e:
-            print(f"ttt edit err: {e}")
+            print(f"ttt edit err: {str(e)[:150]}")
             try:
                 await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
             except Exception as e2:
-                print(f"ttt fallback send err: {e2}")
+                print(f"ttt fallback send err: {str(e2)[:150]}")
 
 
 @dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(".ttt")))
@@ -1426,7 +1459,9 @@ async def cmd_unmute(message: Message):
 async def on_business_connection(connection):
     try:
         if connection.is_enabled:
-            BUSINESS_CONNECTIONS[connection.id] = connection.user.id
+            BUSINESS_CONNECTIONS[connection.id] = {"user_id": connection.user.id}
+            DATA.setdefault("business_owners", {})[connection.id] = connection.user.id
+            save_data(DATA)
             print(f"Business подключён: {connection.id} -> user {connection.user.id}")
             try:
                 await bot.send_message(
@@ -1443,6 +1478,8 @@ async def on_business_connection(connection):
                 print(f"business notify err: {str(e)[:200]}")
         else:
             BUSINESS_CONNECTIONS.pop(connection.id, None)
+            DATA.get("business_owners", {}).pop(connection.id, None)
+            save_data(DATA)
             for cid, game in list(TTT_GAMES.items()):
                 if game.get("bc_id") == connection.id:
                     TTT_GAMES.pop(cid, None)
@@ -1459,8 +1496,10 @@ async def bc_cmd_ttt(message: Message):
         if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
             try:
                 await bot.send_message(chat_id, "⚠️ Игра уже идёт.", business_connection_id=bc_id)
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_peer_invalid(e):
+                    await _notify_owner_bc_dead(bc_id, chat_id)
+                    return
             return
         user = message.from_user
         name = user.full_name or (f"@{user.username}" if user.username else "Игрок")
@@ -1477,7 +1516,7 @@ async def bc_cmd_ttt(message: Message):
         err = str(e)
         print(f"bc_cmd_ttt err: {err[:200]}")
         if _is_peer_invalid(e):
-            _cleanup_dead_business(message.chat.id, message.business_connection_id)
+            await _notify_owner_bc_dead(message.business_connection_id, message.chat.id)
 
 
 @dp.business_message(F.text.func(lambda t: t and t.strip().lower().startswith(".mute")))
@@ -1487,8 +1526,9 @@ async def bc_cmd_mute(message: Message):
         if not is_owner(message.from_user):
             try:
                 await bot.send_message(message.chat.id, "Только владелец.", business_connection_id=bc_id)
-            except Exception:
-                pass
+            except Exception as e:
+                if _is_peer_invalid(e):
+                    await _notify_owner_bc_dead(bc_id, message.chat.id)
             return
         target = _target_user_from_message(message)
         if not target:
@@ -1507,7 +1547,7 @@ async def bc_cmd_mute(message: Message):
             err = str(e)
             print(f"bc mute reply err: {err[:200]}")
             if _is_peer_invalid(e):
-                _cleanup_dead_business(message.chat.id, bc_id)
+                await _notify_owner_bc_dead(bc_id, message.chat.id)
     except Exception as e:
         print(f"bc_cmd_mute err: {str(e)[:200]}")
 
@@ -1537,18 +1577,14 @@ async def bc_cmd_unmute(message: Message):
                 await bot.send_message(message.chat.id, f"Так и быть, говори, {html_mod.escape(name)}.",
                                        business_connection_id=bc_id)
             except Exception as e:
-                err = str(e)
-                print(f"bc unmute reply err: {err[:200]}")
                 if _is_peer_invalid(e):
-                    _cleanup_dead_business(message.chat.id, bc_id)
+                    await _notify_owner_bc_dead(bc_id, message.chat.id)
         else:
             try:
                 await bot.send_message(message.chat.id, "Он и так не в муте.", business_connection_id=bc_id)
             except Exception as e:
-                err = str(e)
-                print(f"bc unmute reply err: {err[:200]}")
                 if _is_peer_invalid(e):
-                    _cleanup_dead_business(message.chat.id, bc_id)
+                    await _notify_owner_bc_dead(bc_id, message.chat.id)
     except Exception as e:
         print(f"bc_cmd_unmute err: {str(e)[:200]}")
 
@@ -1575,7 +1611,7 @@ async def bc_mute_enforcer(message: Message):
                 err = str(e)
                 print(f"bc mute delete err: {err[:200]}")
                 if _is_peer_invalid(e):
-                    _cleanup_dead_business(chat_id, bc_id)
+                    await _notify_owner_bc_dead(bc_id, chat_id)
                 return
             try:
                 await bot.send_message(
@@ -1586,7 +1622,7 @@ async def bc_mute_enforcer(message: Message):
                 err = str(e)
                 print(f"bc mute send err: {err[:200]}")
                 if _is_peer_invalid(e):
-                    _cleanup_dead_business(chat_id, bc_id)
+                    await _notify_owner_bc_dead(bc_id, chat_id)
     except Exception as e:
         print(f"bc_mute_enforcer err: {str(e)[:200]}")
 
@@ -2525,7 +2561,7 @@ async def set_bot_commands():
         await bot.set_my_commands(commands)
         print("Команды установлены")
     except Exception as e:
-        print(f"set_my_commands err: {e}")
+        print(f"set_my_commands err: {str(e)[:150]}")
 
 
 async def set_bot_menu():
@@ -2533,7 +2569,7 @@ async def set_bot_menu():
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
         print("Меню-кнопка установлена")
     except Exception as e:
-        print(f"set_chat_menu_button err: {e}")
+        print(f"set_chat_menu_button err: {str(e)[:150]}")
 
 
 async def preload_stt():
