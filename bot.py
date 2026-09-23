@@ -6,6 +6,7 @@ import html as html_mod
 import asyncio
 import secrets
 import random
+import shutil
 import urllib.request
 import urllib.parse
 import subprocess
@@ -19,6 +20,7 @@ from aiogram.types import (
     MenuButtonCommands, InputMediaPhoto,
 )
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -43,7 +45,19 @@ DATA_FILE = "data.json"
 KEY_LENGTH = 12
 KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+# --- Настройка сессии с увеличенными таймаутами и прокси ---
+_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+_session_kwargs = {"timeout": 60}
+if _proxy:
+    _session_kwargs["proxy"] = _proxy
+    print(f"Использую прокси: {_proxy}")
+
+session = AiohttpSession(**_session_kwargs)
+bot = Bot(
+    token=BOT_TOKEN,
+    session=session,
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
 dp = Dispatcher()
 
 BOT_USERNAME_CACHE = None
@@ -96,24 +110,41 @@ def _empty_data():
     return {"keys": {}, "users": {}, "sticker_packs": {}, "whispers": {}, "whisper_counter": 1}
 
 
+def _validate_data(d):
+    """Приводит структуру к ожидаемому виду, добавляет недостающие ключи."""
+    if not isinstance(d, dict):
+        return _empty_data()
+    d.setdefault("keys", {})
+    d.setdefault("users", {})
+    d.setdefault("sticker_packs", {})
+    d.setdefault("whispers", {})
+    d.setdefault("whisper_counter", 1)
+    return d
+
+
 def load_data_from_file():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                d.setdefault("keys", {})
-                d.setdefault("users", {})
-                d.setdefault("sticker_packs", {})
-                d.setdefault("whispers", {})
-                d.setdefault("whisper_counter", 1)
-                return d
-        except Exception as e:
-            print(f"load_data_from_file: {e}")
+    """Читает локальный файл, при проблемах пробует .bak."""
+    for path in (DATA_FILE, DATA_FILE + ".bak"):
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                print(f"load_data_from_file: OK из {path} "
+                      f"(keys={len(d.get('keys', {}))}, users={len(d.get('users', {}))})")
+                return _validate_data(d)
+            except Exception as e:
+                print(f"load_data_from_file {path}: {e}")
     return _empty_data()
 
 
 def save_data_to_file(data):
+    """Сохраняет, делает backup предыдущего."""
     try:
+        if os.path.exists(DATA_FILE):
+            try:
+                shutil.copy2(DATA_FILE, DATA_FILE + ".bak")
+            except Exception as e:
+                print(f"backup err: {e}")
         tmp = DATA_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -122,62 +153,104 @@ def save_data_to_file(data):
         print(f"save_data_to_file: {e}")
 
 
+async def _tg_api_get(url, params=None, timeout=30):
+    """Обёртка над GET к Telegram API с retry."""
+    import aiohttp
+    last_err = None
+    for attempt in range(3):
+        try:
+            t = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=t) as s:
+                async with s.get(url, params=params) as r:
+                    return await r.json()
+        except Exception as e:
+            last_err = e
+            print(f"_tg_api_get attempt {attempt+1}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    raise last_err if last_err else RuntimeError("get failed")
+
+
+async def _tg_download_file(url, timeout=60):
+    """Скачивает файл из Telegram с retry."""
+    import aiohttp
+    last_err = None
+    for attempt in range(3):
+        try:
+            t = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=t) as s:
+                async with s.get(url) as r:
+                    return await r.read()
+        except Exception as e:
+            last_err = e
+            print(f"_tg_download_file attempt {attempt+1}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(2)
+    raise last_err if last_err else RuntimeError("download failed")
+
+
 async def load_data_from_tg():
+    """Загружает данные из закреплённого файла в storage-чате.
+    При любой ошибке — fallback на локальный файл + .bak."""
     if not STORAGE_CHAT_ID:
         print("STORAGE_CHAT_ID не задан, читаю из файла")
         return load_data_from_file()
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as s:
+
+    for attempt in range(4):
+        try:
+            # 1. getChat
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getChat"
-            async with s.get(url, params={"chat_id": STORAGE_CHAT_ID}) as r:
-                resp = await r.json()
-        if not resp.get("ok"):
-            print(f"load_data_from_tg getChat: {resp}")
-            return load_data_from_file()
+            resp = await _tg_api_get(url, params={"chat_id": STORAGE_CHAT_ID})
+            if not resp.get("ok"):
+                print(f"load_data_from_tg getChat: {resp}")
+                break
 
-        pinned = resp["result"].get("pinned_message")
-        if not pinned or "document" not in pinned:
-            print("load_data_from_tg: нет закреплённого файла, читаю из file")
-            return load_data_from_file()
+            pinned = resp["result"].get("pinned_message")
+            if not pinned or "document" not in pinned:
+                print("load_data_from_tg: нет закреплённого файла, читаю из file")
+                return load_data_from_file()
 
-        file_id = pinned["document"]["file_id"]
-        async with aiohttp.ClientSession() as s:
+            file_id = pinned["document"]["file_id"]
+
+            # 2. getFile
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile"
-            async with s.get(url, params={"file_id": file_id}) as r:
-                fdata = await r.json()
-        if not fdata.get("ok"):
-            print(f"load_data_from_tg getFile: {fdata}")
-            return load_data_from_file()
+            fdata = await _tg_api_get(url, params={"file_id": file_id})
+            if not fdata.get("ok"):
+                print(f"load_data_from_tg getFile: {fdata}")
+                break
 
-        file_path = fdata["result"]["file_path"]
-        async with aiohttp.ClientSession() as s:
+            file_path = fdata["result"]["file_path"]
+
+            # 3. Скачиваем содержимое
             url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-            async with s.get(url) as r:
-                content = await r.read()
+            content = await _tg_download_file(url)
 
-        d = json.loads(content.decode("utf-8"))
-        d.setdefault("keys", {})
-        d.setdefault("users", {})
-        d.setdefault("sticker_packs", {})
-        d.setdefault("whispers", {})
-        d.setdefault("whisper_counter", 1)
-        print(f"load_data_from_tg OK: keys={len(d['keys'])}, users={len(d['users'])}, whispers={len(d['whispers'])}")
-        save_data_to_file(d)
-        return d
-    except Exception as e:
-        print(f"load_data_from_tg err: {e}")
-        return load_data_from_file()
+            d = json.loads(content.decode("utf-8"))
+            d = _validate_data(d)
+            print(f"load_data_from_tg OK: keys={len(d['keys'])}, "
+                  f"users={len(d['users'])}, whispers={len(d['whispers'])}")
+            save_data_to_file(d)
+            return d
+
+        except Exception as e:
+            print(f"load_data_from_tg attempt {attempt+1} err: {e}")
+            if attempt < 3:
+                await asyncio.sleep(3 * (attempt + 1))
+
+    print("load_data_from_tg: все попытки провалились, читаю локально")
+    return load_data_from_file()
 
 
 async def save_data_to_tg(data):
+    """Сохраняет в storage-чат. Тихо логирует ошибки, не роняет бота."""
     save_data_to_file(data)
     if not STORAGE_CHAT_ID:
         return
     try:
         import aiohttp
         content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-        async with aiohttp.ClientSession() as s:
+        t = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=t) as s:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
             form = aiohttp.FormData()
             form.add_field("chat_id", str(STORAGE_CHAT_ID))
@@ -192,8 +265,10 @@ async def save_data_to_tg(data):
         if not resp.get("ok"):
             print(f"save_data_to_tg send: {resp}")
             return
+
         msg_id = resp["result"]["message_id"]
-        async with aiohttp.ClientSession() as s:
+
+        async with aiohttp.ClientSession(timeout=t) as s:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage"
             async with s.post(url, data={
                 "chat_id": STORAGE_CHAT_ID,
@@ -204,7 +279,7 @@ async def save_data_to_tg(data):
         if not presp.get("ok"):
             print(f"save_data_to_tg pin: {presp}")
     except Exception as e:
-        print(f"save_data_to_tg err: {e}")
+        print(f"save_data_to_tg err: {str(e)[:200]}")
 
 
 DATA = _empty_data()
@@ -297,7 +372,6 @@ def cleanup_expired_whispers():
 
 
 def _cleanup_dead_business(chat_id: int, bc_id: str):
-    """Убирает мёртвые игры/муты при BUSINESS_PEER_INVALID."""
     if chat_id in TTT_GAMES and TTT_GAMES[chat_id].get("bc_id") == bc_id:
         TTT_GAMES.pop(chat_id, None)
     MUTED.pop(chat_id, None)
@@ -2434,7 +2508,7 @@ async def keep_alive():
             me = await bot.get_me()
             print(f"keep-alive: @{me.username}")
         except Exception as e:
-            print(f"keep-alive: {e}")
+            print(f"keep-alive: {str(e)[:200]}")
 
 
 async def set_bot_commands():
