@@ -522,49 +522,27 @@ def other_site_download(url, mode):
 
 
 def split_image(image_path, total_parts):
-    img = Image.open(image_path).convert("RGB")
+    img = Image.open(image_path)
+    # Конвертим в RGB, чтобы убрать возможную альфу
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     w, h = img.size
     cols = 3
     rows = total_parts // cols
-    
-    # 1. Центральный кроп до пропорций 3:4 (чтобы каждый кусочек был ровным квадратом)
-    target_ar = cols / rows
-    current_ar = w / h
-    
-    if current_ar > target_ar:
-        new_w = int(h * target_ar)
-        left = (w - new_w) // 2
-        img = img.crop((left, 0, left + new_w, h))
-    else:
-        new_h = int(w / target_ar)
-        top = (h - new_h) // 2
-        img = img.crop((0, top, w, top + new_h))
-        
-    w, h = img.size
     pw = w // cols
     ph = h // rows
-    
-    # 2. Масштабируем, чтобы все кусочки были абсолютно одинаковыми по пикселям
-    new_w = pw * cols
-    new_h = ph * rows
-    if (new_w, new_h) != (w, h):
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        
     files = []
     for row in range(rows):
         for col in range(cols):
             left = col * pw
             top = row * ph
-            right = left + pw
-            bottom = top + ph
-            
+            right = (col + 1) * pw if col < cols - 1 else w
+            bottom = (row + 1) * ph if row < rows - 1 else h
             crop = img.crop((left, top, right, bottom))
             fn = f"temp_photos/part_{row}_{col}.png"
-            
-            # Сохраняем в PNG (без потери качества)
-            crop.save(fn, "PNG")
+            # PNG без потерь, быстрое сжатие
+            crop.save(fn, "PNG", optimize=False, compress_level=1)
             files.append(fn)
-            
     return files
 
 
@@ -798,8 +776,11 @@ async def cmd_keys(message: Message):
     await _send_keys_list(message)
 
 
-@dp.message(F.text == "🔑 Создать ключ")
+# --- Reply-кнопки владельца (толерантные к эмодзи) ---
+
+@dp.message(F.text.contains("Создать ключ"))
 async def btn_newkey(message: Message):
+    print(f"btn_newkey: text={message.text!r}")
     if not is_owner(message.from_user):
         return
     b = InlineKeyboardBuilder()
@@ -808,8 +789,9 @@ async def btn_newkey(message: Message):
     await message.answer("❓ Какой ключ делаем?", reply_markup=b.as_markup())
 
 
-@dp.message(F.text == "📋 Статусы ключей")
+@dp.message(F.text.contains("Статусы ключей"))
 async def btn_keys(message: Message):
+    print(f"btn_keys: text={message.text!r}")
     if not is_owner(message.from_user):
         return
     await _send_keys_list(message)
@@ -1506,8 +1488,7 @@ async def execute_splitting(msg_obj, state, pp, n):
         loop = asyncio.get_event_loop()
         parts = await loop.run_in_executor(None, split_image, pp, n)
 
-        # Числовая сортировка (row, col) — правильный порядок:
-        # part_0_0 → part_0_1 → part_0_2 → part_1_0 → ...
+        # Числовая сортировка: (row, col). part_0_0, part_0_1, part_0_2, part_1_0, ...
         def sort_key(path):
             m = re.search(r'part_(\d+)_(\d+)', path)
             if m:
@@ -1518,8 +1499,7 @@ async def execute_splitting(msg_obj, state, pp, n):
         total = len(parts)
         print(f"split: {total} частей, порядок: {[os.path.basename(p) for p in parts[:6]]}...")
 
-        # Отправляем как ДОКУМЕНТЫ — без сжатия. Telegram сжимает фото,
-        # из-за чего на стыках появляется "плитка" и меняется качество.
+        # Отправляем как ДОКУМЕНТЫ в PNG — без сжатия Telegram
         for i, pf in enumerate(parts):
             if not os.path.exists(pf):
                 continue
@@ -1540,9 +1520,8 @@ async def execute_splitting(msg_obj, state, pp, n):
 
         await st.delete()
         await msg_obj.answer(
-            f"✅ Готово! {total} кусочков.\n"
-            f"Порядок: слева-направо, сверху-вниз (01 → {total:02d}).\n"
-            f"Скачай файлы и залей в профиль по порядку."
+            f"✅ Готово! {total} кусочков (PNG, без сжатия).\n"
+            f"Порядок: слева-направо, сверху-вниз (01 → {total:02d})."
         )
     except Exception as e:
         print(f"split err: {e}")
