@@ -23,7 +23,6 @@ try:
     HAS_GTTS = True
 except ImportError:
     HAS_GTTS = False
-    print("[tts] gTTS не установлен")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN: raise ValueError("нет BOT_TOKEN")
@@ -41,6 +40,7 @@ WHISPER_TTL = 86400
 HISTORY_LIMIT = 60
 UNO_LOBBY_TIMEOUT = 60
 UNO_LOBBY_TICK = 10
+MAFIA_LOBBY_TIMEOUT = 60
 BTN_CREATE_KEY = "🔑 Создать ключ"
 BTN_KEYS_STATUS = "📋 Статусы ключей"
 
@@ -54,6 +54,7 @@ BOT_USERNAME_CACHE = None
 STT_MODEL = None
 TTT_GAMES = {}
 UNO_GAMES = {}
+MAFIA_GAMES = {}
 MUTED = {}
 BUSINESS_CONNECTIONS = {}
 
@@ -74,8 +75,7 @@ os.makedirs("downloads", exist_ok=True)
 os.makedirs("temp_photos", exist_ok=True)
 
 FUNNY_REPLIES = ["Ержан, фу, нельзя, место!", "Дорогая, не лезь, оно тебя сожрёт",
-    "Тебя в детстве не учили не нажимать куда попало?", "Это не твоё. Отойди.",
-    "Руки убрал!", "Не для тебя писали.", "Кыш.", "А тебе кто разрешил?"]
+    "Это не твоё. Отойди.", "Руки убрал!", "Кыш.", "А тебе кто разрешил?"]
 RULETKA_WIN = ["🍀 Повезло, повезло… не делай так больше.",
     "😅 Щёлк — и пусто. Пронесло.", "🎯 Ты выжил.",
     "💨 Курок щёлкнул вхолостую."]
@@ -92,20 +92,25 @@ EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F000-\U0
     "\U0001F900-\U0001F9FF\U00002700-\U000027BF\U0001F1E6-\U0001F1FF"
     "\U0001FA00-\U0001FAFF]+", flags=re.UNICODE)
 DASH_RE = re.compile(r"\s*[-\u2013\u2014\u2212\u2015]\s*")
-DOT_SPACES_RE = re.compile(r"\s+")
+SPACE_RE = re.compile(r"\s+")
 
 
-def _normalize_dot(t):
-    if not t: return ""
-    return DOT_SPACES_RE.sub("", t.strip().lower())
+def _cmd(t, *names):
+    """Универсальный фильтр команд. Ловит .cmd /cmd cmd .уно .гтщ, с пробелами и точкой в конце."""
+    if not t: return False
+    s = SPACE_RE.sub("", t.strip().lower()).rstrip(".!?,;:")
+    return s in names
 
 
-def dot_starts(*cmds):
-    def check(t):
-        if not t: return False
-        s = _normalize_dot(t)
-        return any(s.startswith(c) for c in cmds)
-    return check
+# Кириллические пары для каждой dot-команды
+UNO_VARIANTS = (".uno", "/uno", "uno", ".уно", "/уно", "уно", ".гтщ", "/гтщ", "гтщ")
+RL_VARIANTS = (".rl", ".рулетка", "рулетка", ".ruletka", "/ruletka", "ruletka", ".кд", "кд")
+TTT_VARIANTS = (".ttt", "/ttt", ".еее", "/еее", ".ттт", "ттт")
+MUTE_VARIANTS = (".mute", "/mute", ".ьгте", ".ьутв", ".муте", "муте")
+UNMUTE_VARIANTS = (".unmute", "/unmute", ".гтьутв", ".гьутв")
+SWITCH_VARIANTS = (".switch", "/switch", ".ыцшыеср", ".сщьше")
+TTS_VARIANTS = (".tts", "/tts", ".еес", ".ееы")
+HELP_VARIANTS = (".help", "/help", ".рудз", ".рфз")
 
 
 def _empty_data():
@@ -187,11 +192,11 @@ async def load_data_from_tg():
             url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
             content = await _tg_download_file(url)
             d = _validate_data(json.loads(content.decode("utf-8")))
-            print(f"load OK: keys={len(d['keys'])}, users={len(d['users'])}")
+            print(f"load OK: keys={len(d['keys'])}, users={len(d['users'])}", flush=True)
             save_data_to_file(d)
             return d
         except Exception as e:
-            print(f"load tg {attempt+1}: {str(e)[:120]}")
+            print(f"load tg {attempt+1}: {str(e)[:120]}", flush=True)
             if attempt < 3: await asyncio.sleep(3 * (attempt + 1))
     return load_data_from_file()
 
@@ -216,7 +221,7 @@ async def save_data_to_tg(data):
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/pinChatMessage"
             async with s.post(url, data={"chat_id": STORAGE_CHAT_ID, "message_id": msg_id,
                                           "disable_notification": True}) as r: await r.json()
-    except Exception as e: print(f"save tg: {str(e)[:150]}")
+    except Exception as e: print(f"save tg: {str(e)[:150]}", flush=True)
 
 
 DATA = _empty_data()
@@ -227,7 +232,7 @@ async def save_data_sync(data=None):
     save_data_to_file(d)
     if STORAGE_CHAT_ID:
         try: await save_data_to_tg(d)
-        except Exception as e: print(f"save_data_sync: {str(e)[:150]}")
+        except Exception as e: print(f"save_sync: {str(e)[:150]}", flush=True)
 
 
 def save_data(data=None):
@@ -421,7 +426,7 @@ def get_duration(path):
 
 FFMPEG_EXE_PATH, FFPROBE_EXE_PATH = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
 FFMPEG_DIR = os.path.dirname(FFMPEG_EXE_PATH)
-print(f"ffmpeg: {FFMPEG_EXE_PATH}")
+print(f"ffmpeg: {FFMPEG_EXE_PATH}", flush=True)
 for folder in ("downloads", "temp_photos"):
     if os.path.exists(folder):
         for f in os.listdir(folder):
@@ -434,7 +439,7 @@ for folder in ("downloads", "temp_photos"):
 def get_stt_model():
     global STT_MODEL
     if STT_MODEL is None:
-        print(f"STT ({STT_SIZE})...")
+        print(f"STT ({STT_SIZE})...", flush=True)
         from faster_whisper import WhisperModel
         STT_MODEL = WhisperModel(STT_SIZE, device="cpu", compute_type="int8")
     return STT_MODEL
@@ -483,7 +488,7 @@ def _tts_generate(text, out):
     gTTS(text=text, lang="ru").save(out); return out
 
 
-ALWAYS_FREE = {"/start", "/help", "/code", "/mykey", "/whoami", "/whisper", "/cancel", "/uno", "/play"}
+ALWAYS_FREE = {"/start", "/help", "/code", "/mykey", "/whoami", "/whisper", "/cancel", "/uno", "/play", "/mafia"}
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -492,6 +497,9 @@ class AccessMiddleware(BaseMiddleware):
         user = event.from_user
         if user is None: return await handler(event, data)
         chat_id = event.chat.id if event.chat else None
+        text = (getattr(event, "text", None) or "").strip()
+        if text:
+            print(f"[MIDDLE] uid={user.id} type={event.chat.type} text={text[:50]!r}", flush=True)
         if chat_id and chat_id in MUTED and user.id in MUTED[chat_id]:
             if not is_owner(user):
                 try: await event.delete()
@@ -499,11 +507,10 @@ class AccessMiddleware(BaseMiddleware):
                 try: await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!")
                 except Exception: pass
                 return
-        text = (getattr(event, "text", None) or "").strip()
         if not text:
             return await handler(event, data)
-        norm = _normalize_dot(text)
-        if norm.startswith("."):
+        s = SPACE_RE.sub("", text.strip().lower()).rstrip(".!?,;:")
+        if s.startswith("."):
             return await handler(event, data)
         cmd = text.split()[0].lower() if text else ""
         if cmd in ALWAYS_FREE: return await handler(event, data)
@@ -537,7 +544,7 @@ async def try_activate_key(event, user, key):
     if not perm: entry["expires_at"] = now + dur
     DATA["users"][uid] = entry
     await save_data_sync(DATA)
-    print(f"[key] активация сохранена: {key} -> uid={uid}")
+    print(f"[key] сохранил {key} -> uid={uid}", flush=True)
     if perm: await event.answer("✅ <b>Ключ активирован!</b>\n♾ навсегда", parse_mode="HTML")
     else: await event.answer(f"✅ <b>Ключ активирован!</b>\n⏱ {format_duration(dur)}", parse_mode="HTML")
 
@@ -689,20 +696,16 @@ async def _do_revoke(message, arg=None):
         if info: await save_data_sync(DATA); await message.answer("✅ Отозван."); return
 
 
-@dp.message(F.text.func(dot_starts(".ruletka", ".rl")))
+# ============ РУЛЕТКА ============
+@dp.message(F.text.func(lambda t: _cmd(t, *RL_VARIANTS)))
 async def cmd_ruletka(message):
+    print(f"[rl] HIT text={message.text!r}", flush=True)
     await _try_delete_command(message)
     win = random.random() < 5/6
     await message.answer(random.choice(RULETKA_WIN if win else RULETKA_LOSE))
 
 
-@dp.message(F.text.func(dot_starts("рулетка")))
-async def cmd_ruletka2(message):
-    await _try_delete_command(message)
-    win = random.random() < 5/6
-    await message.answer(random.choice(RULETKA_WIN if win else RULETKA_LOSE))
-
-
+# ============ ГОЛОСОВЫЕ ============
 @dp.message(F.voice)
 async def process_voice(message, state):
     await state.set_state(None); await _handle_stt(message, message.voice.file_id, ".ogg")
@@ -713,12 +716,13 @@ async def process_video_note(message, state):
     await state.set_state(None); await _handle_stt(message, message.video_note.file_id, ".mp4")
 
 
-@dp.message(F.text.func(dot_starts(".switch")))
+# ============ SWITCH / TTS ============
+@dp.message(F.text.func(lambda t: _cmd(t, *SWITCH_VARIANTS)))
 async def cmd_switch(message):
     if message.chat.type in ("group", "supergroup", "channel"): return
     await _try_delete_command(message)
     if not message.reply_to_message:
-        await message.answer("⚠️ Ответь <code>.switch</code> на сообщение.", parse_mode="HTML"); return
+        await message.answer("⚠️ Ответь на сообщение.", parse_mode="HTML"); return
     src = message.reply_to_message.text or message.reply_to_message.caption or ""
     if not src.strip(): await message.answer("⚠️ Нет текста."); return
     conv, dr = _convert_layout(src)
@@ -727,7 +731,7 @@ async def cmd_switch(message):
                           reply_to_message_id=message.reply_to_message.message_id)
 
 
-@dp.message(F.text.func(dot_starts(".tts")))
+@dp.message(F.text.func(lambda t: _cmd(t, *TTS_VARIANTS)))
 async def cmd_tts(message):
     if message.chat.type in ("group", "supergroup", "channel"): return
     await _try_delete_command(message)
@@ -757,13 +761,14 @@ async def cmd_tts(message):
             except Exception: pass
 
 
+# ============ МУТ ============
 def _target_from_msg(message):
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
     return None
 
 
-@dp.message(F.text.func(dot_starts(".unmute")))
+@dp.message(F.text.func(lambda t: _cmd(t, *UNMUTE_VARIANTS)))
 async def cmd_unmute(message):
     await _try_delete_command(message)
     if not is_owner(message.from_user): return
@@ -775,8 +780,9 @@ async def cmd_unmute(message):
         await message.answer("Так и быть, говори.")
 
 
-@dp.message(F.text.func(dot_starts(".mute")))
+@dp.message(F.text.func(lambda t: _cmd(t, *MUTE_VARIANTS)))
 async def cmd_mute(message):
+    print(f"[mute] HIT text={message.text!r} owner={is_owner(message.from_user)}", flush=True)
     await _try_delete_command(message)
     if not is_owner(message.from_user): return
     target = _target_from_msg(message)
@@ -786,332 +792,7 @@ async def cmd_mute(message):
     MUTED.setdefault(message.chat.id, set()).add(target.id)
     name = target.full_name or str(target.id)
     await message.answer(f"🔇 <b>МОЛЧАТЬ!!!</b> {html_mod.escape(name)}", parse_mode="HTML")
-
-
-HELP_TEXT = ("📖 <b>Что умею:</b>\n\n"
-    "🎲 <code>.ruletka</code> — рулетка\n"
-    "❌⭕ <code>.ttt</code> — крестики-нолики\n"
-    "🎴 <code>.uno</code> — Уно в ЛС (с ботом)\n"
-    "🎴 <code>/uno</code> — Уно в группе\n"
-    "🔁 <code>.switch</code> — раскладка (ЛС)\n"
-    "🔊 <code>.tts текст</code> — озвучка (ЛС)\n"
-    "🎤 голосовое — расшифровка\n"
-    "📷 фото — на куски (ЛС)\n"
-    "🎬 ссылка — видео/MP3 (ЛС)\n"
-    "🎨 <code>/stickers</code> — стикерпаки\n"
-    "🔑 <code>/mykey</code> — ключ\n")
-
-
-@dp.message(F.text.func(lambda t: _normalize_dot(t) in ("/help", ".help")))
-async def cmd_help(message): await message.answer(HELP_TEXT, parse_mode="HTML")
-
-
-@dp.message(F.text == "/start")
-async def cmd_start(message):
-    if is_owner(message.from_user):
-        await message.answer(HELP_TEXT + "\n👑 Админ-панель.", reply_markup=owner_reply_kb(), parse_mode="HTML")
-    else:
-        await message.answer(HELP_TEXT + "\n🔑 /code ТВОЙ_КЛЮЧ", parse_mode="HTML")
-
-
-@dp.message(F.text == "/whoami")
-async def cmd_whoami(message):
-    u = message.from_user
-    await message.answer(f"ID: {u.id}\nТы владелец? {'ДА' if is_owner(u) else 'НЕТ'}")
-
-
-@dp.message(F.text.startswith("/code"))
-async def cmd_code(message):
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2: await message.answer("⚠️ /code КЛЮЧ"); return
-    await try_activate_key(message, message.from_user, parts[1].strip().strip("`").strip().upper())
-
-
-@dp.message(F.text == "/mykey")
-async def cmd_mykey(message):
-    u = DATA["users"].get(str(message.from_user.id))
-    if not u: await message.answer("🤷 Нет ключа."); return
-    if u.get("permanent"): await message.answer(f"🔑 <code>{html_mod.escape(u.get('key'))}</code>\n♾ навсегда", parse_mode="HTML")
-    else:
-        exp = u.get("expires_at", 0); rem = max(0, exp - time.time())
-        await message.answer(f"🔑 <code>{html_mod.escape(u.get('key'))}</code>\n⏳ {format_duration(rem)}", parse_mode="HTML")
-
-
-@dp.message(F.text == "/cancel")
-async def cmd_cancel(message, state):
-    await state.clear()
-    UNO_GAMES.pop(message.chat.id, None)
-    TTT_GAMES.pop(message.chat.id, None)
-    await message.answer("👌")
-
-
-@dp.message(F.text == "/whisper")
-async def cmd_whisper(message):
-    uname = await get_bot_username()
-    await message.answer(f"🤫 <code>@{uname} текст @username</code>", parse_mode="HTML")
-
-
-@dp.message(F.document & F.document.mime_type.startswith("image/"))
-async def process_photo_document(message, state):
-    if message.chat.type in ("group", "supergroup", "channel"): return
-    d = message.document; fi = await bot.get_file(d.file_id)
-    ext = os.path.splitext(d.file_name or "img.png")[1] or ".png"
-    lp = f"temp_photos/{d.file_id}{ext}"
-    await bot.download_file(fi.file_path, lp)
-    await state.update_data(photo_path=lp); await state.set_state(BotStates.waiting_for_parts)
-    b = InlineKeyboardBuilder()
-    b.button(text="🎲 Авто", callback_data="auto_split"); b.button(text="📎 Оригинал", callback_data="send_original")
-    await message.answer("✂️ На сколько кусков? (кратно 3)", reply_markup=b.as_markup())
-
-
-@dp.message(F.photo)
-async def process_photo(message, state):
-    if message.chat.type in ("group", "supergroup", "channel"): return
-    p = message.photo[-1]; fi = await bot.get_file(p.file_id)
-    lp = f"temp_photos/{p.file_id}.jpg"
-    await bot.download_file(fi.file_path, lp)
-    await state.update_data(photo_path=lp); await state.set_state(BotStates.waiting_for_parts)
-    b = InlineKeyboardBuilder()
-    b.button(text="🎲 Авто", callback_data="auto_split"); b.button(text="📎 Оригинал", callback_data="send_original")
-    await message.answer("⚠️ Пришли <b>как файл</b>.\n✂️ На сколько?", reply_markup=b.as_markup(), parse_mode="HTML")
-
-
-@dp.callback_query(F.data == "auto_split", BotStates.waiting_for_parts)
-async def auto_split(cb, state):
-    d = await state.get_data(); pp = d.get("photo_path")
-    if not pp or not os.path.exists(pp): await cb.answer("Файл потерялся", show_alert=True); await state.clear(); return
-    await cb.message.edit_reply_markup(reply_markup=None)
-    loop = asyncio.get_event_loop()
-    n = await loop.run_in_executor(None, calculate_auto_parts, pp)
-    await cb.message.answer(f"🎲 {n} кусков."); await execute_splitting(cb.message, state, pp, n); await cb.answer()
-
-
-@dp.callback_query(F.data == "send_original", BotStates.waiting_for_parts)
-async def send_original(cb, state):
-    d = await state.get_data(); pp = d.get("photo_path")
-    if not pp or not os.path.exists(pp): await cb.answer("Нет", show_alert=True); await state.clear(); return
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await cb.message.answer_document(FSInputFile(pp, filename=os.path.basename(pp)), caption="📎 Оригинал.")
-    await state.clear(); await cb.answer()
-
-
-@dp.message(BotStates.waiting_for_parts)
-async def process_parts(message, state):
-    if not message.text or not message.text.isdigit(): await message.answer("❗ Цифру."); return
-    n = int(message.text)
-    if n < 3 or n % 3 != 0: await message.answer("⚠️ Кратно 3."); return
-    d = await state.get_data(); await execute_splitting(message, state, d.get("photo_path"), n)
-
-
-async def execute_splitting(msg_obj, state, pp, n):
-    st = await msg_obj.answer("🔪 Режу...")
-    try:
-        loop = asyncio.get_event_loop()
-        parts = await loop.run_in_executor(None, split_image, pp, n)
-        def sk(p):
-            m = re.search(r'part_(\d+)_(\d+)', p)
-            return (int(m.group(1)), int(m.group(2))) if m else (999, 999)
-        parts = sorted(parts, key=sk); total = len(parts)
-        for i, pf in enumerate(parts):
-            if not os.path.exists(pf): continue
-            await msg_obj.answer_photo(photo=FSInputFile(pf, filename=f"{i+1:02d}.png"), caption=f"{i+1}/{total}")
-            await asyncio.sleep(0.4)
-        for pf in parts:
-            if os.path.exists(pf):
-                try: os.remove(pf)
-                except Exception: pass
-        try: await st.delete()
-        except Exception: pass
-        await msg_obj.answer(f"✅ Готово! {total}")
-    except Exception as e: await msg_obj.answer(f"❌ {e}")
-    finally:
-        if os.path.exists(pp):
-            try: os.remove(pp)
-            except Exception: pass
-        await state.clear()
-
-
-@dp.message(F.text.contains("http://") | F.text.contains("https://"))
-async def ask_type(message, state):
-    if message.chat.type in ("group", "supergroup", "channel"): return
-    url = message.text.strip()
-    if "youtube.com" in url or "youtu.be" in url:
-        await message.answer("⚠️ YouTube не работает."); return
-    await state.update_data(download_url=url); await state.set_state(BotStates.waiting_for_media_type)
-    b = InlineKeyboardBuilder()
-    b.button(text="🎵 MP3", callback_data="get_audio"); b.button(text="🎬 MP4", callback_data="get_video")
-    await message.answer("❓ Что?", reply_markup=b.as_markup())
-
-
-@dp.callback_query(F.data.in_({"get_audio", "get_video"}), BotStates.waiting_for_media_type)
-async def process_download(cb, state):
-    d = await state.get_data(); url = d.get("download_url"); mode = cb.data
-    await cb.message.edit_reply_markup(reply_markup=None)
-    status = await cb.message.answer("⏳ Качаю..."); await cb.answer()
-    loop = asyncio.get_event_loop()
-    is_tk = "tiktok.com" in url or "vm.tiktok.com" in url or "vt.tiktok.com" in url
-    fn = None
-    try:
-        if is_tk:
-            fn, title, dur, _, _ = await loop.run_in_executor(None, tiktok_via_api, url, mode)
-        else:
-            fn, title, dur, _, _ = await loop.run_in_executor(None, other_site_download, url, mode)
-        if not fn or not os.path.exists(fn): raise FileNotFoundError("не скачалось")
-        if mode == "get_audio":
-            kw = {"audio": FSInputFile(fn, filename=f"{title}.mp3"), "title": title, "caption": "🎵"}
-            if dur: kw["duration"] = int(dur)
-            await cb.message.answer_audio(**kw)
-        else:
-            await cb.message.answer_video(video=FSInputFile(fn, filename=f"{title}.mp4"),
-                                          caption="🎬", duration=int(dur) if dur else None)
-        try: await status.delete()
-        except Exception: pass
-    except Exception as e:
-        try: await status.edit_text(f"😔 {str(e)[:250]}")
-        except Exception: pass
-    finally:
-        if fn and os.path.exists(fn):
-            try: os.remove(fn)
-            except Exception: pass
-        await state.clear()
-
-
-@dp.message(F.text == "/stickers")
-async def cmd_stickers(message, state):
-    if message.chat.type in ("group", "supergroup", "channel"): return
-    b = InlineKeyboardBuilder()
-    b.button(text="➕ Создать", callback_data="st_create")
-    b.button(text="📎 Добавить", callback_data="st_add")
-    b.button(text="📂 Мои", callback_data="st_list")
-    b.adjust(1)
-    await message.answer("🎨 <b>Стикерпаки</b>", reply_markup=b.as_markup(), parse_mode="HTML")
-
-
-@dp.callback_query(F.data == "st_create")
-async def cb_st_create(cb, state):
-    if cb.message.chat.type != "private": await cb.answer("Только ЛС", show_alert=True); return
-    uname = await get_bot_username()
-    await cb.message.edit_text(f"📝 Имя (латиница). Пак: <code>имя_by_{uname}</code>", parse_mode="HTML")
-    await state.set_state(BotStates.waiting_sticker_name); await cb.answer()
-
-
-@dp.message(BotStates.waiting_sticker_name)
-async def process_sticker_name(message, state):
-    short = (message.text or "").strip().lower()
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]{0,50}$", short):
-        await message.answer("⚠️ Только латиница/цифры/_"); return
-    uname = await get_bot_username(); full = f"{short}_by_{uname}"
-    await state.update_data(sticker_full=full)
-    await state.set_state(BotStates.waiting_sticker_title)
-    await message.answer("📛 Название:")
-
-
-@dp.message(BotStates.waiting_sticker_title)
-async def process_sticker_title(message, state):
-    title = (message.text or "").strip()
-    if not title: await message.answer("⚠️ Не пустое."); return
-    await state.update_data(sticker_title=title)
-    await state.set_state(BotStates.waiting_sticker_first)
-    await message.answer("🖼 Картинку.")
-
-
-def photo_to_webp_sticker(src, dst):
-    img = Image.open(src).convert("RGBA"); w, h = img.size; side = max(w, h)
-    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-    canvas.paste(img, ((side - w) // 2, (side - h) // 2))
-    canvas = canvas.resize((512, 512), Image.LANCZOS)
-    canvas.save(dst, "WEBP", quality=95, method=6); return dst
-
-
-@dp.message(BotStates.waiting_sticker_first, F.photo)
-async def process_sticker_first(message, state):
-    data = await state.get_data(); full = data.get("sticker_full"); title = data.get("sticker_title")
-    if not full or not title: await message.answer("⚠️ /stickers"); await state.clear(); return
-    p = message.photo[-1]; fi = await bot.get_file(p.file_id)
-    src = f"temp_photos/{p.file_id}.jpg"; dst = f"temp_photos/sticker_{p.file_id}.webp"
-    await bot.download_file(fi.file_path, src)
-    status = await message.answer("🎨 Готовлю...")
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, photo_to_webp_sticker, src, dst)
-        with open(dst, "rb") as f: sb = f.read()
-        await bot.create_new_sticker_set(user_id=message.from_user.id, name=full, title=title,
-            stickers=[InputSticker(sticker=BufferedInputFile(sb, filename="s.webp"),
-                                    format="static", emoji_list=["😀"])])
-        uid = str(message.from_user.id)
-        DATA["sticker_packs"].setdefault(uid, []).append({"name": full, "title": title})
-        await save_data_sync(DATA)
-        await status.edit_text(f"✅ Пак создан!\n🔗 https://t.me/addstickers/{full}")
-    except Exception as e:
-        try: await status.edit_text(f"❌ {str(e)[:300]}")
-        except Exception: pass
-    finally:
-        for f in (src, dst):
-            if os.path.exists(f):
-                try: os.remove(f)
-                except Exception: pass
-        await state.clear()
-
-
-@dp.callback_query(F.data == "st_list")
-async def cb_st_list(cb):
-    if cb.message.chat.type != "private": await cb.answer("Только ЛС", show_alert=True); return
-    packs = DATA["sticker_packs"].get(str(cb.from_user.id), [])
-    if not packs: await cb.message.edit_text("📂 Нет паков."); await cb.answer(); return
-    lines = ["📂 Паки:\n"] + [f"• {html_mod.escape(p['title'])}\n  https://t.me/addstickers/{p['name']}" for p in packs]
-    await cb.message.edit_text("\n".join(lines), parse_mode="HTML"); await cb.answer()
-
-
-@dp.callback_query(F.data == "st_add")
-async def cb_st_add(cb, state):
-    if cb.message.chat.type != "private": await cb.answer("Только ЛС", show_alert=True); return
-    packs = DATA["sticker_packs"].get(str(cb.from_user.id), [])
-    if not packs: await cb.message.edit_text("📂 Нет паков."); await cb.answer(); return
-    b = InlineKeyboardBuilder()
-    for i, p in enumerate(packs): b.button(text=p["title"], callback_data=f"st_pick:{i}")
-    b.adjust(1)
-    await cb.message.edit_text("📎 В какой?", reply_markup=b.as_markup()); await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("st_pick:"))
-async def cb_st_pick(cb, state):
-    if cb.message.chat.type != "private": await cb.answer("Только ЛС", show_alert=True); return
-    try: idx = int(cb.data.split(":", 1)[1])
-    except: await cb.answer("Ошибка", show_alert=True); return
-    packs = DATA["sticker_packs"].get(str(cb.from_user.id), [])
-    if idx < 0 or idx >= len(packs): await cb.answer("Нет", show_alert=True); return
-    await state.update_data(add_pack=packs[idx]["name"])
-    await state.set_state(BotStates.waiting_sticker_add_photo)
-    await cb.message.edit_text(f"📎 {html_mod.escape(packs[idx]['title'])}", parse_mode="HTML")
-    await cb.answer()
-
-
-@dp.message(BotStates.waiting_sticker_add_photo, F.photo)
-async def process_sticker_add(message, state):
-    data = await state.get_data(); pname = data.get("add_pack")
-    if not pname: await message.answer("⚠️ /stickers"); await state.clear(); return
-    p = message.photo[-1]; fi = await bot.get_file(p.file_id)
-    src = f"temp_photos/{p.file_id}.jpg"; dst = f"temp_photos/sticker_{p.file_id}.webp"
-    await bot.download_file(fi.file_path, src)
-    status = await message.answer("🎨 Готовлю...")
-    try:
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, photo_to_webp_sticker, src, dst)
-        with open(dst, "rb") as f: sb = f.read()
-        await bot.add_sticker_to_set(user_id=message.from_user.id, name=pname,
-            sticker=InputSticker(sticker=BufferedInputFile(sb, filename="s.webp"),
-                                  format="static", emoji_list=["😀"]))
-        await status.edit_text("✅ Добавлен.")
-    except Exception as e:
-        try: await status.edit_text(f"❌ {str(e)[:250]}")
-        except Exception: pass
-    finally:
-        for f in (src, dst):
-            if os.path.exists(f):
-                try: os.remove(f)
-                except Exception: pass
-        await state.clear()
-        # ============ ШЁПОТ ============
+    # ============ ШЁПОТ ============
 def _next_whisper_id():
     c = int(DATA.get("whisper_counter", 1)); DATA["whisper_counter"] = c + 1; return c
 
@@ -1205,9 +886,10 @@ def _ttt_kb(game):
     return b.as_markup()
 
 
-@dp.message(F.text.func(dot_starts(".ttt")))
-async def cmd_ttt(message):
-    print(f"[ttt] HIT chat={message.chat.id} text={message.text!r}")
+@dp.message(F.text.func(lambda t: _cmd(t, *TTT_VARIANTS)))
+async def cmd_ttt(message, state):
+    print(f"[ttt] HIT text={message.text!r} chat={message.chat.id}", flush=True)
+    await state.clear()
     await _try_delete_command(message)
     chat_id = message.chat.id
     if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
@@ -1386,7 +1068,7 @@ def _uno_dm_kb(game, uid):
 
 async def _uno_send_dm(uid, game):
     try: await bot.send_message(uid, _uno_dm_text(game, uid), reply_markup=_uno_dm_kb(game, uid), parse_mode="HTML")
-    except Exception as e: print(f"[uno dm {uid}] {str(e)[:120]}")
+    except Exception as e: print(f"[uno dm {uid}] {str(e)[:120]}", flush=True)
 
 
 async def _uno_refresh_group(game, chat_id):
@@ -1479,16 +1161,10 @@ async def _uno_bot(game, chat_id):
     await _uno_after(game, chat_id, 0, card)
 
 
-# --- УНО в ЛС: ловит .uno /uno uno .уно .гтщ .uno. . uno ---
-def _is_uno_ls(t):
-    if not t: return False
-    s = DOT_SPACES_RE.sub("", t.strip().lower()).rstrip(".!?,;:")
-    return s in (".uno", "/uno", "uno", ".уно", "/уно", "уно", ".гтщ", "/гтщ", "гтщ")
-
-
-@dp.message(F.text.func(_is_uno_ls))
-async def cmd_uno_dot(message):
-    print(f"[uno-ls] HIT uid={message.from_user.id} type={message.chat.type} text={message.text!r}")
+@dp.message(F.text.func(lambda t: _cmd(t, *UNO_VARIANTS)))
+async def cmd_uno_dot(message, state):
+    print(f"[uno] HIT text={message.text!r} type={message.chat.type}", flush=True)
+    await state.clear()
     if message.chat.type != "private": return
     await _try_delete_command(message)
     chat_id = message.chat.id
@@ -1567,25 +1243,27 @@ async def _uno_lobby_tick(chat_id):
             return
 
 
-# --- УНО в группе: /uno ---
-@dp.message(F.text.func(lambda t: t and _normalize_dot(t).startswith("/uno")))
-async def cmd_uno_group(message):
+@dp.message(F.text.func(lambda t: t and (t.strip().startswith("/uno") or t.strip().startswith("/мафия") or t.strip().startswith("/mafia"))))
+async def cmd_uno_mafia_group(message, state):
     if message.chat.type == "private": return
-    await _try_delete_command(message)
-    chat_id = message.chat.id
-    if chat_id in UNO_GAMES and UNO_GAMES[chat_id].get("started"):
-        await message.answer("⚠️ Игра уже идёт."); return
-    args = (message.text or "").split()
-    no_timer = any(a.lower() == "notimer" for a in args[1:])
-    u = message.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
-    UNO_GAMES[chat_id] = {"mode": "group", "players": [{"id": u.id, "name": name}],
-                          "bc_id": message.business_connection_id, "no_timer": no_timer,
-                          "time_left": UNO_LOBBY_TIMEOUT, "started": False, "deck": [], "hands": {}}
-    game = UNO_GAMES[chat_id]
-    b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="uno_join")
-    msg = await message.answer(_uno_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
-    game["lobby_msg_id"] = msg.message_id
-    if not no_timer: asyncio.create_task(_uno_lobby_tick(chat_id))
+    txt = (message.text or "").strip().lower()
+    if txt.startswith("/uno"):
+        await state.clear()
+        await _try_delete_command(message)
+        chat_id = message.chat.id
+        if chat_id in UNO_GAMES and UNO_GAMES[chat_id].get("started"):
+            await message.answer("⚠️ Игра уже идёт."); return
+        args = (message.text or "").split()
+        no_timer = any(a.lower() == "notimer" for a in args[1:])
+        u = message.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
+        UNO_GAMES[chat_id] = {"mode": "group", "players": [{"id": u.id, "name": name}],
+                              "bc_id": message.business_connection_id, "no_timer": no_timer,
+                              "time_left": UNO_LOBBY_TIMEOUT, "started": False, "deck": [], "hands": {}}
+        game = UNO_GAMES[chat_id]
+        b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="uno_join")
+        msg = await message.answer(_uno_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+        game["lobby_msg_id"] = msg.message_id
+        if not no_timer: asyncio.create_task(_uno_lobby_tick(chat_id))
 
 
 @dp.callback_query(F.data == "uno_join")
@@ -1606,7 +1284,8 @@ async def cb_uno_join(cb):
 
 
 @dp.message(F.text == "/play")
-async def cmd_play(message):
+async def cmd_play(message, state):
+    await state.clear()
     await _try_delete_command(message)
     chat_id = message.chat.id
     game = UNO_GAMES.get(chat_id)
@@ -1738,6 +1417,281 @@ async def cb_uno_surrender(cb):
 async def cb_uno_noop(cb): await cb.answer()
 
 
+# ============ МАФИЯ ============
+ROLES = {"mafia": "🔫 Мафия", "doctor": "💊 Доктор", "detective": "🔍 Комиссар", "civilian": "👤 Мирный"}
+MAFIA_MIN = 4
+
+
+def _mafia_assign(players):
+    n = len(players)
+    mafia_count = max(1, n // 4)
+    roles = ["mafia"] * mafia_count + ["doctor", "detective"] + ["civilian"] * (n - mafia_count - 2)
+    random.shuffle(roles)
+    for p, r in zip(players, roles): p["role"] = r
+
+
+def _mafia_lobby_text(game):
+    players = game["players"]
+    lines = ["🔫 <b>Набор в Мафию</b>\n"]
+    if players:
+        lines.append(f"👥 ({len(players)}): " + ", ".join(html_mod.escape(p["name"]) for p in players))
+    lines.append(f"\n⚠️ Нужно минимум {MAFIA_MIN} (сейчас {len(players)})")
+    if game.get("no_timer"): lines.append("\n⏸ Таймер отключён. Старт: <code>/play</code>")
+    else: lines.append(f"\n⏱ Старт через <b>{game.get('time_left', MAFIA_LOBBY_TIMEOUT)}</b> сек.")
+    return "\n".join(lines)
+
+
+async def _mafia_lobby_tick(chat_id):
+    while True:
+        await asyncio.sleep(UNO_LOBBY_TICK)
+        game = MAFIA_GAMES.get(chat_id)
+        if not game or game.get("state") != "lobby": return
+        if game.get("no_timer"): continue
+        game["time_left"] = max(0, game.get("time_left", MAFIA_LOBBY_TIMEOUT) - UNO_LOBBY_TICK)
+        b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="mafia_join")
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
+                                         text=_mafia_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+        except Exception: pass
+        if game["time_left"] <= 0:
+            try: await bot.send_message(chat_id, "⏱ Время вышло. Жду <code>/play</code>.", parse_mode="HTML")
+            except Exception: pass
+            return
+
+
+@dp.message(F.text.func(lambda t: t and (t.strip().lower().startswith("/mafia") or t.strip().lower().startswith("/мафия"))))
+async def cmd_mafia(message, state):
+    await state.clear()
+    if message.chat.type == "private":
+        await message.answer("🔫 Мафия только в группах."); return
+    await _try_delete_command(message)
+    chat_id = message.chat.id
+    if chat_id in MAFIA_GAMES and MAFIA_GAMES[chat_id].get("state") not in ("lobby", "finished"):
+        await message.answer("⚠️ Игра уже идёт."); return
+    args = (message.text or "").split()
+    no_timer = any(a.lower() == "notimer" for a in args[1:])
+    u = message.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
+    MAFIA_GAMES[chat_id] = {"players": [{"id": u.id, "name": name, "alive": True, "role": None}],
+                            "bc_id": message.business_connection_id, "no_timer": no_timer,
+                            "time_left": MAFIA_LOBBY_TIMEOUT, "state": "lobby", "day": 0}
+    game = MAFIA_GAMES[chat_id]
+    b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="mafia_join")
+    msg = await message.answer(_mafia_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+    game["lobby_msg_id"] = msg.message_id
+    if not no_timer: asyncio.create_task(_mafia_lobby_tick(chat_id))
+
+
+@dp.callback_query(F.data == "mafia_join")
+async def cb_mafia_join(cb):
+    chat_id = cb.message.chat.id
+    game = MAFIA_GAMES.get(chat_id)
+    if not game or game.get("state") != "lobby": await cb.answer("Лобби закрыто", show_alert=True); return
+    uid = cb.from_user.id
+    if any(p["id"] == uid for p in game["players"]): await cb.answer("Ты уже тут", show_alert=True); return
+    if len(game["players"]) >= 10: await cb.answer("Максимум 10", show_alert=True); return
+    u = cb.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
+    game["players"].append({"id": uid, "name": name, "alive": True, "role": None})
+    b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="mafia_join")
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
+                                     text=_mafia_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+    except Exception: pass
+    await cb.answer("Зашёл!")
+
+
+async def _mafia_start(chat_id):
+    game = MAFIA_GAMES.get(chat_id)
+    if not game: return
+    game["state"] = "starting"; game["day"] = 1
+    _mafia_assign(game["players"])
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
+                                     text="🔫 <b>Мафия началась!</b>", parse_mode="HTML")
+    except Exception: pass
+    for p in game["players"]:
+        try:
+            await bot.send_message(p["id"], f"🔫 Твоя роль: <b>{ROLES[p['role']]}</b>\n\nИгра началась!", parse_mode="HTML")
+        except Exception:
+            try: await bot.send_message(chat_id, f"⚠️ {html_mod.escape(p['name'])} — напиши боту /start в ЛС.")
+            except Exception: pass
+    await asyncio.sleep(2)
+    await _mafia_night(chat_id)
+
+
+async def _mafia_night(chat_id):
+    game = MAFIA_GAMES.get(chat_id)
+    if not game or game.get("state") in ("finished", "cancelled"): return
+    game["state"] = "night"
+    game["night_actions"] = {"mafia": None, "doctor": None, "detective": None}
+    alive = [p for p in game["players"] if p["alive"]]
+    txt = f"🌙 <b>НОЧЬ {game['day']}</b>\n\nЖивые:\n" + "\n".join(f"• {html_mod.escape(p['name'])}" for p in alive)
+    txt += "\n\nВсе спят. Мафия, доктор и комиссар — проверьте ЛС."
+    try: await bot.send_message(chat_id, txt, parse_mode="HTML")
+    except Exception: pass
+    for p in alive:
+        try:
+            if p["role"] == "mafia":
+                others = [x for x in alive if x["role"] != "mafia"]
+                b = InlineKeyboardBuilder()
+                for x in others: b.button(text=html_mod.escape(x["name"]), callback_data=f"mafia_kill:{x['id']}")
+                b.adjust(2)
+                await bot.send_message(p["id"], "🔫 <b>Ты мафия.</b> Кого убить?", reply_markup=b.as_markup(), parse_mode="HTML")
+            elif p["role"] == "doctor":
+                b = InlineKeyboardBuilder()
+                for x in alive: b.button(text=html_mod.escape(x["name"]), callback_data=f"mafia_save:{x['id']}")
+                b.adjust(2)
+                await bot.send_message(p["id"], "💊 <b>Ты доктор.</b> Кого спасти?", reply_markup=b.as_markup(), parse_mode="HTML")
+            elif p["role"] == "detective":
+                others = [x for x in alive if x["id"] != p["id"]]
+                b = InlineKeyboardBuilder()
+                for x in others: b.button(text=html_mod.escape(x["name"]), callback_data=f"mafia_check:{x['id']}")
+                b.adjust(2)
+                await bot.send_message(p["id"], "🔍 <b>Ты комиссар.</b> Кого проверить?", reply_markup=b.as_markup(), parse_mode="HTML")
+        except Exception: pass
+    asyncio.create_task(_mafia_night_timeout(chat_id))
+
+
+async def _mafia_night_timeout(chat_id):
+    await asyncio.sleep(60)
+    await _mafia_end_night(chat_id)
+
+
+@dp.callback_query(F.data.startswith("mafia_kill:"))
+async def cb_mafia_kill(cb):
+    uid = cb.from_user.id; target = int(cb.data.split(":", 1)[1])
+    for cid, g in MAFIA_GAMES.items():
+        if g.get("state") != "night": continue
+        for p in g["players"]:
+            if p["id"] == uid and p["role"] == "mafia":
+                g["night_actions"]["mafia"] = target
+                await cb.answer("Выбрано"); return
+    await cb.answer("Не твоя кнопка", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("mafia_save:"))
+async def cb_mafia_save(cb):
+    uid = cb.from_user.id; target = int(cb.data.split(":", 1)[1])
+    for cid, g in MAFIA_GAMES.items():
+        if g.get("state") != "night": continue
+        for p in g["players"]:
+            if p["id"] == uid and p["role"] == "doctor":
+                g["night_actions"]["doctor"] = target
+                await cb.answer("Спасаешь"); return
+    await cb.answer("Не твоя кнопка", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("mafia_check:"))
+async def cb_mafia_check(cb):
+    uid = cb.from_user.id; target = int(cb.data.split(":", 1)[1])
+    for cid, g in MAFIA_GAMES.items():
+        if g.get("state") != "night": continue
+        for p in g["players"]:
+            if p["id"] == uid and p["role"] == "detective":
+                t = next((x for x in g["players"] if x["id"] == target), None)
+                if t:
+                    is_m = t["role"] == "mafia"
+                    await cb.answer(f"{'🔫 МАФИЯ!' if is_m else '👤 Мирный'}", show_alert=True)
+                return
+    await cb.answer("Не твоя кнопка", show_alert=True)
+
+
+def _mafia_check_end(game):
+    alive = [p for p in game["players"] if p["alive"]]
+    mafia = [p for p in alive if p["role"] == "mafia"]
+    civs = [p for p in alive if p["role"] != "mafia"]
+    if not mafia: return True, "👤 Победа мирных! Мафия мертва."
+    if len(mafia) >= len(civs): return True, "🔫 Победа мафии!"
+    return False, ""
+
+
+async def _mafia_end_night(chat_id):
+    game = MAFIA_GAMES.get(chat_id)
+    if not game or game.get("state") != "night": return
+    acts = game["night_actions"]
+    victim_id = acts.get("mafia"); saved_id = acts.get("doctor")
+    killed_name = None
+    if victim_id and victim_id != saved_id:
+        victim = next((p for p in game["players"] if p["id"] == victim_id), None)
+        if victim and victim["alive"]:
+            victim["alive"] = False; killed_name = victim["name"]
+    if killed_name: text = f"☀️ <b>ДЕНЬ {game['day']}</b>\n\n💀 Погиб <b>{html_mod.escape(killed_name)}</b>."
+    else: text = f"☀️ <b>ДЕНЬ {game['day']}</b>\n\n🌅 Все выжили."
+    end, msg = _mafia_check_end(game)
+    if end:
+        game["state"] = "finished"
+        text += f"\n\n🏁 {msg}"
+        try: await bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception: pass
+        MAFIA_GAMES.pop(chat_id, None); return
+    try: await bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception: pass
+    await asyncio.sleep(2)
+    await _mafia_vote(chat_id)
+
+
+async def _mafia_vote(chat_id):
+    game = MAFIA_GAMES.get(chat_id)
+    if not game or game.get("state") == "finished": return
+    game["state"] = "vote"; game["votes"] = {}
+    alive = [p for p in game["players"] if p["alive"]]
+    b = InlineKeyboardBuilder()
+    for p in alive: b.button(text=html_mod.escape(p["name"]), callback_data=f"mafia_vote:{p['id']}")
+    b.adjust(2)
+    txt = f"🗳 <b>Голосование дня {game['day']}</b>\n\nКого посадить? У вас 60 сек."
+    try: await bot.send_message(chat_id, txt, reply_markup=b.as_markup(), parse_mode="HTML")
+    except Exception: pass
+    asyncio.create_task(_mafia_vote_timeout(chat_id))
+
+
+async def _mafia_vote_timeout(chat_id):
+    await asyncio.sleep(60)
+    await _mafia_end_vote(chat_id)
+
+
+@dp.callback_query(F.data.startswith("mafia_vote:"))
+async def cb_mafia_vote(cb):
+    chat_id = cb.message.chat.id
+    game = MAFIA_GAMES.get(chat_id)
+    if not game or game.get("state") != "vote": await cb.answer("Не голосование", show_alert=True); return
+    uid = cb.from_user.id
+    if not any(p["id"] == uid and p["alive"] for p in game["players"]):
+        await cb.answer("Ты не игрок", show_alert=True); return
+    target = int(cb.data.split(":", 1)[1])
+    game["votes"][uid] = target
+    await cb.answer("Голос принят")
+
+
+async def _mafia_end_vote(chat_id):
+    game = MAFIA_GAMES.get(chat_id)
+    if not game or game.get("state") != "vote": return
+    votes = game.get("votes", {})
+    if not votes: text = "🗳 Никто не голосовал."
+    else:
+        counter = {}
+        for t in votes.values(): counter[t] = counter.get(t, 0) + 1
+        max_v = max(counter.values())
+        top = [k for k, v in counter.items() if v == max_v]
+        if len(top) > 1: text = "🗳 Ничья. Никто не посажен."
+        else:
+            voted_id = top[0]
+            vp = next((p for p in game["players"] if p["id"] == voted_id), None)
+            if vp:
+                vp["alive"] = False
+                text = f"⚖️ <b>{html_mod.escape(vp['name'])}</b> посажен.\nОн был: {ROLES[vp['role']]}"
+            else: text = "🗳 Ошибка."
+    end, msg = _mafia_check_end(game)
+    if end:
+        text += f"\n\n🏁 {msg}"
+        try: await bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception: pass
+        MAFIA_GAMES.pop(chat_id, None); return
+    try: await bot.send_message(chat_id, text, parse_mode="HTML")
+    except Exception: pass
+    await asyncio.sleep(2)
+    game["day"] += 1
+    await _mafia_night(chat_id)
+
+
 # ============ БИЗНЕС ============
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
@@ -1747,12 +1701,12 @@ async def on_business_connection(connection: BusinessConnection):
             DATA.setdefault("business_owners", {})[connection.id] = connection.user.id
             if connection.id in DATA.get("dead_bc", []):
                 DATA["dead_bc"] = [x for x in DATA["dead_bc"] if x != connection.id]
-            save_data(DATA); print(f"Business подключён: {connection.id}")
+            save_data(DATA); print(f"Business подключён: {connection.id}", flush=True)
         else:
             BUSINESS_CONNECTIONS.pop(connection.id, None)
             DATA.get("business_owners", {}).pop(connection.id, None)
             save_data(DATA)
-    except Exception as e: print(f"business: {str(e)[:150]}")
+    except Exception as e: print(f"business: {str(e)[:150]}", flush=True)
 
 
 @dp.business_message()
@@ -1775,7 +1729,7 @@ async def bc_main(message: Message):
             except Exception: pass
             try: await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!", business_connection_id=bc_id)
             except Exception: pass
-    except Exception as e: print(f"bc_main: {str(e)[:150]}")
+    except Exception as e: print(f"bc_main: {str(e)[:150]}", flush=True)
 
 
 @dp.business_message(F.voice)
@@ -1792,7 +1746,7 @@ async def bc_voice(message):
         text, _ = await loop.run_in_executor(None, _stt_pipeline, src, wav)
         preview = (f"📝 Расшифровка:\n\n{text[:3900]}" if text else "🤷 Не разобрал.")
         await bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id, text=preview, business_connection_id=bc)
-    except Exception as e: print(f"bc stt: {str(e)[:150]}")
+    except Exception as e: print(f"bc stt: {str(e)[:150]}", flush=True)
     finally:
         for p in (src, wav):
             if os.path.exists(p):
@@ -1800,7 +1754,7 @@ async def bc_voice(message):
                 except Exception: pass
 
 
-# ============ HTTP-СЕРВЕР ДЛЯ HEALTHCHECK ============
+# ============ HTTP / ЗАПУСК ============
 async def _health(request):
     return web.Response(text="ok")
 
@@ -1815,7 +1769,7 @@ async def _run_http_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"[HTTP] healthcheck на 0.0.0.0:{port}")
+    print(f"[HTTP] healthcheck на 0.0.0.0:{port}", flush=True)
 
 
 async def keep_alive():
@@ -1823,8 +1777,8 @@ async def keep_alive():
         try:
             await asyncio.sleep(240)
             me = await bot.get_me()
-            print(f"keep-alive: @{me.username}")
-        except Exception as e: print(f"keep-alive: {str(e)[:120]}")
+            print(f"keep-alive: @{me.username}", flush=True)
+        except Exception as e: print(f"keep-alive: {str(e)[:120]}", flush=True)
 
 
 async def set_bot_commands():
@@ -1836,16 +1790,17 @@ async def set_bot_commands():
         BotCommand(command="stickers", description="Стикерпаки"),
         BotCommand(command="whisper", description="Шёпот"),
         BotCommand(command="uno", description="Уно"),
-        BotCommand(command="play", description="Старт Уно в группе"),
+        BotCommand(command="mafia", description="Мафия"),
+        BotCommand(command="play", description="Старт"),
         BotCommand(command="cancel", description="Отмена"),
     ]
     try: await bot.set_my_commands(cmds)
-    except Exception as e: print(f"cmds: {e}")
+    except Exception as e: print(f"cmds: {e}", flush=True)
 
 
 async def set_bot_menu():
     try: await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    except Exception as e: print(f"menu: {e}")
+    except Exception as e: print(f"menu: {e}", flush=True)
 
 
 dp.message.middleware(AccessMiddleware())
@@ -1855,16 +1810,15 @@ async def main():
     global DATA
     asyncio.create_task(_run_http_server())
     await asyncio.sleep(0.5)
-
     DATA = await load_data_from_tg()
-    print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}")
+    print(f"keys: {len(DATA['keys'])}, users: {len(DATA['users'])}", flush=True)
     await set_bot_commands()
     await set_bot_menu()
     asyncio.create_task(keep_alive())
-    print("Bot started")
+    print("Bot started", flush=True)
     await dp.start_polling(bot, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): print("stopped")
+    except (KeyboardInterrupt, SystemExit): print("stopped", flush=True)
