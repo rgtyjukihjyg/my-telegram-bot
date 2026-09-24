@@ -573,6 +573,8 @@ class AccessMiddleware(BaseMiddleware):
         if text:
             print(f"[MIDDLE] uid={user.id} type={event.chat.type} biz={bool(bc)} text={text[:50]!r}",
                   flush=True)
+
+        # мут
         if chat_id and chat_id in MUTED and user.id in MUTED[chat_id] and not is_owner(user):
             try:
                 if bc:
@@ -588,6 +590,13 @@ class AccessMiddleware(BaseMiddleware):
                     await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!")
             except Exception: pass
             return
+
+        # ===== ФИКС 1: в бизнес-чатах ключ НЕ требуется =====
+        # Это ЛС владельца с его друзьями через бизнес-подключение.
+        # Владелец общается как обычно, друзья — тоже. Ключи не нужны.
+        if bc:
+            return await handler(event, data)
+
         if not text:
             return await handler(event, data)
         s = SPACE_RE.sub("", text.strip().lower()).rstrip(".!?,;:")
@@ -640,7 +649,11 @@ class BusinessHistoryMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+# ===== ФИКС 2: владелец не может активировать ключ =====
 async def try_activate_key(event, user, key):
+    if is_owner(user):
+        await event.answer("👑 Ты владелец — ключи тебе не нужны.")
+        return
     kd = DATA["keys"].get(key); uid = str(user.id)
     if not kd: await event.answer("❌ Нет такого ключа."); return
     if kd.get("used_by") is not None:
@@ -752,7 +765,7 @@ async def cmd_help(message: Message):
     await message.answer(
         "📖 <b>Команды</b>\n\n"
         "🎮 <code>.ttt</code> — крестики-нолики\n"
-        "🎴 <code>.uno</code> — Уно против бота (ЛС)\n"
+        "🎴 <code>.uno</code> — Уно (в ЛС против бота, в группе/бизнес-чате PvP)\n"
         "🎴 <code>/uno</code> — Уно в группе\n"
         "🎴 <code>/uno notimer</code> — лобби без таймера\n"
         "🔫 <code>/mafia</code> — Мафия (группа)\n"
@@ -768,6 +781,9 @@ async def cmd_help(message: Message):
 
 @dp.message(F.text.startswith("/code"))
 async def cmd_code(message: Message):
+    if is_owner(message.from_user):
+        await message.answer("👑 Ты владелец — ключи тебе не нужны.")
+        return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("⚠️ <code>/code ТВОЙ_КЛЮЧ</code>", parse_mode="HTML")
@@ -1408,27 +1424,54 @@ async def _uno_bot(game, chat_id):
     await _uno_after(game, chat_id, 0, card)
 
 
+# ===== ФИКС 3: .uno в бизнес-чате = PvP-лобби, а не против бота =====
 @dp.message(F.text.func(lambda t: _cmd(t, *UNO_VARIANTS)))
 async def cmd_uno_dot(message: Message, state: FSMContext):
-    print(f"[uno] HIT text={message.text!r} type={message.chat.type} biz={bool(message.business_connection_id)}",
-          flush=True)
+    print(f"[uno] HIT text={message.text!r} type={message.chat.type} "
+          f"biz={bool(message.business_connection_id)}", flush=True)
     await state.clear()
-    if message.chat.type != "private":
+    bc = message.business_connection_id
+
+    # ЛС с самим ботом (без бизнес-подключения): игра против бота
+    if message.chat.type == "private" and not bc:
+        await _try_delete_command(message)
+        chat_id = message.chat.id
+        if chat_id in UNO_GAMES:
+            await message.answer("⚠️ Игра уже идёт. /cancel чтобы сбросить."); return
+        uid = message.from_user.id
+        d = _uno_diff(uid)
+        b = InlineKeyboardBuilder()
+        for k, label in DIFF_LABELS.items():
+            mark = "✅ " if k == d else ""
+            b.button(text=f"{mark}{label}", callback_data=f"uno_diff:{k}")
+        b.row(InlineKeyboardButton(text="🚀 Начать", callback_data="uno_start_ls"))
+        b.adjust(1)
+        await message.answer(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>",
+                              reply_markup=b.as_markup(), parse_mode="HTML")
         return
+
+    # группа ИЛИ бизнес-чат: PvP-лобби
     await _try_delete_command(message)
     chat_id = message.chat.id
-    if chat_id in UNO_GAMES:
-        await message.answer("⚠️ Игра уже идёт. /cancel чтобы сбросить."); return
-    uid = message.from_user.id
-    d = _uno_diff(uid)
+    if chat_id in UNO_GAMES and UNO_GAMES[chat_id].get("started"):
+        await message.answer("⚠️ Игра уже идёт."); return
+    args = (message.text or "").split()
+    no_timer = any(a.lower() == "notimer" for a in args[1:]) or bool(bc)
+    u = message.from_user
+    name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
+    UNO_GAMES[chat_id] = {"mode": "group",
+                          "players": [{"id": u.id, "name": name}],
+                          "bc_id": bc, "no_timer": no_timer,
+                          "time_left": UNO_LOBBY_TIMEOUT, "started": False,
+                          "deck": [], "hands": {}}
+    game = UNO_GAMES[chat_id]
     b = InlineKeyboardBuilder()
-    for k, label in DIFF_LABELS.items():
-        mark = "✅ " if k == d else ""
-        b.button(text=f"{mark}{label}", callback_data=f"uno_diff:{k}")
-    b.row(InlineKeyboardButton(text="🚀 Начать", callback_data="uno_start_ls"))
-    b.adjust(1)
-    await message.answer(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>",
-                          reply_markup=b.as_markup(), parse_mode="HTML")
+    b.button(text="🙋 Присоединиться", callback_data="uno_join")
+    msg = await message.answer(_uno_lobby_text(game),
+                                reply_markup=b.as_markup(), parse_mode="HTML")
+    game["lobby_msg_id"] = msg.message_id
+    if not no_timer:
+        asyncio.create_task(_uno_lobby_tick(chat_id))
 
 
 @dp.callback_query(F.data.startswith("uno_diff:"))
@@ -1498,7 +1541,7 @@ async def _uno_lobby_tick(chat_id):
 
 @dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(("/uno", "/мафия", "/mafia"))))
 async def cmd_uno_mafia_group(message: Message, state: FSMContext):
-    if message.chat.type == "private": return
+    if message.chat.type == "private" and not message.business_connection_id: return
     txt = (message.text or "").strip().lower()
     if txt.startswith("/uno"):
         await state.clear()
@@ -1727,7 +1770,7 @@ async def _mafia_lobby_tick(chat_id):
 @dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(("/mafia", "/мафия"))))
 async def cmd_mafia(message: Message, state: FSMContext):
     await state.clear()
-    if message.chat.type == "private":
+    if message.chat.type == "private" and not message.business_connection_id:
         await message.answer("🔫 Мафия только в группах."); return
     await _try_delete_command(message)
     chat_id = message.chat.id
@@ -2054,8 +2097,7 @@ dp.message.outer_middleware(AccessMiddleware())
 dp.business_message.outer_middleware(BusinessHistoryMiddleware())
 dp.business_message.outer_middleware(AccessMiddleware())
 
-# КРИТИЧНО: в бизнес-чате апдейты приходят как business_message, а не message.
-# Переиспользуем те же HandlerObject — просто копируем список.
+# Зеркалим message-хендлеры в business_message — используем тот же список HandlerObject
 dp.business_message.handlers.extend(dp.message.handlers)
 print(f"[mirror] скопировано хендлеров: {len(dp.message.handlers)}", flush=True)
 
