@@ -1,6 +1,5 @@
 import os, re, json, time, html as html_mod, asyncio, secrets, random, shutil
 import urllib.request, urllib.parse, subprocess
-from collections import Counter
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import (
@@ -282,12 +281,6 @@ def user_status(user_id):
 
 def _is_peer_invalid(err): return "BUSINESS_PEER_INVALID" in str(err)
 def _is_dead_bc(bc_id): return bc_id in DATA.get("dead_bc", [])
-
-
-def _mark_bc_dead(bc_id):
-    if bc_id not in DATA["dead_bc"]:
-        DATA["dead_bc"].append(bc_id)
-        if len(DATA["dead_bc"]) > 100: DATA["dead_bc"] = DATA["dead_bc"][-100:]
 
 
 async def _try_delete_command(message, bc_id=None):
@@ -786,16 +779,17 @@ async def cmd_mute(message):
 
 
 HELP_TEXT = ("📖 <b>Что умею:</b>\n\n"
-    "🎲 <code>.ruletka</code> или <code>.rl</code> — рулетка\n"
+    "🎲 <code>.ruletka</code> — рулетка\n"
     "❌⭕ <code>.ttt</code> — крестики-нолики\n"
-    "🎴 <code>.uno</code> в ЛС / <code>/uno</code> в группе\n"
-    "🔁 <code>.switch</code> — раскладка (ЛС, реплай)\n"
+    "🎴 <code>.uno</code> — Уно в ЛС (с ботом)\n"
+    "🎴 <code>/uno</code> — Уно в группе\n"
+    "🔁 <code>.switch</code> — раскладка (ЛС)\n"
     "🔊 <code>.tts текст</code> — озвучка (ЛС)\n"
     "🎤 голосовое — расшифровка\n"
     "📷 фото — на куски (ЛС)\n"
     "🎬 ссылка — видео/MP3 (ЛС)\n"
-    "🎨 <code>/stickers</code> — стикерпаки (ЛС)\n"
-    "🔑 <code>/mykey</code> — статус ключа\n")
+    "🎨 <code>/stickers</code> — стикерпаки\n"
+    "🔑 <code>/mykey</code> — ключ\n")
 
 
 @dp.message(F.text.func(lambda t: _normalize_dot(t) in ("/help", ".help")))
@@ -804,7 +798,6 @@ async def cmd_help(message): await message.answer(HELP_TEXT, parse_mode="HTML")
 
 @dp.message(F.text == "/start")
 async def cmd_start(message):
-    bot_uname = await get_bot_username()
     if is_owner(message.from_user):
         await message.answer(HELP_TEXT + "\n👑 Админ-панель.", reply_markup=owner_reply_kb(), parse_mode="HTML")
     else:
@@ -844,8 +837,8 @@ async def cmd_cancel(message, state):
 
 @dp.message(F.text == "/whisper")
 async def cmd_whisper(message):
-    bot_uname = await get_bot_username()
-    await message.answer(f"🤫 <code>@{bot_uname} текст @username</code>", parse_mode="HTML")
+    uname = await get_bot_username()
+    await message.answer(f"🤫 <code>@{uname} текст @username</code>", parse_mode="HTML")
 
 
 @dp.message(F.document & F.document.mime_type.startswith("image/"))
@@ -870,7 +863,7 @@ async def process_photo(message, state):
     await state.update_data(photo_path=lp); await state.set_state(BotStates.waiting_for_parts)
     b = InlineKeyboardBuilder()
     b.button(text="🎲 Авто", callback_data="auto_split"); b.button(text="📎 Оригинал", callback_data="send_original")
-    await message.answer("⚠️ Пришли <b>как файл</b> для качества.\n✂️ На сколько?", reply_markup=b.as_markup(), parse_mode="HTML")
+    await message.answer("⚠️ Пришли <b>как файл</b>.\n✂️ На сколько?", reply_markup=b.as_markup(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "auto_split", BotStates.waiting_for_parts)
@@ -987,8 +980,8 @@ async def cmd_stickers(message, state):
 @dp.callback_query(F.data == "st_create")
 async def cb_st_create(cb, state):
     if cb.message.chat.type != "private": await cb.answer("Только ЛС", show_alert=True); return
-    bot_uname = await get_bot_username()
-    await cb.message.edit_text(f"📝 Имя (латиница). Пак: <code>имя_by_{bot_uname}</code>", parse_mode="HTML")
+    uname = await get_bot_username()
+    await cb.message.edit_text(f"📝 Имя (латиница). Пак: <code>имя_by_{uname}</code>", parse_mode="HTML")
     await state.set_state(BotStates.waiting_sticker_name); await cb.answer()
 
 
@@ -997,7 +990,7 @@ async def process_sticker_name(message, state):
     short = (message.text or "").strip().lower()
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]{0,50}$", short):
         await message.answer("⚠️ Только латиница/цифры/_"); return
-    bot_uname = await get_bot_username(); full = f"{short}_by_{bot_uname}"
+    uname = await get_bot_username(); full = f"{short}_by_{uname}"
     await state.update_data(sticker_full=full)
     await state.set_state(BotStates.waiting_sticker_title)
     await message.answer("📛 Название:")
@@ -1108,8 +1101,7 @@ async def process_sticker_add(message, state):
                 try: os.remove(f)
                 except Exception: pass
         await state.clear()
-
-
+        # ============ ШЁПОТ ============
 def _next_whisper_id():
     c = int(DATA.get("whisper_counter", 1)); DATA["whisper_counter"] = c + 1; return c
 
@@ -1174,6 +1166,7 @@ async def cb_whisper(cb):
     else: await cb.answer(random.choice(FUNNY_REPLIES), show_alert=True)
 
 
+# ============ КРЕСТИКИ-НОЛИКИ ============
 TTT_WIN_LINES = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
 
 
@@ -1204,7 +1197,7 @@ def _ttt_kb(game):
 
 @dp.message(F.text.func(dot_starts(".ttt")))
 async def cmd_ttt(message):
-    print(f"[ttt] HIT chat={message.chat.id}")
+    print(f"[ttt] HIT chat={message.chat.id} text={message.text!r}")
     await _try_delete_command(message)
     chat_id = message.chat.id
     if chat_id in TTT_GAMES and not TTT_GAMES[chat_id].get("finished"):
@@ -1273,6 +1266,7 @@ async def cb_ttt_reset(cb):
 async def cb_ttt_noop(cb): await cb.answer()
 
 
+# ============ УНО ============
 UNO_COLORS = ["🔴", "🔵", "🟢", "🟡"]
 COLOR_NAMES = {"🔴": "красный", "🔵": "синий", "🟢": "зелёный", "🟡": "жёлтый", "🌈": "wild"}
 NUM_EMOJI = {0:"0️⃣",1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣",7:"7️⃣",8:"8️⃣",9:"9️⃣"}
@@ -1416,9 +1410,10 @@ async def _uno_after(game, chat_id, uid, card):
 
     if not game["hands"].get(str(uid)):
         winner = next((p["name"] for p in game["players"] if p["id"] == uid), "?")
-        try: await bot.send_message(chat_id, f"🏆 <b>{html_mod.escape(winner)} выиграл!</b>", parse_mode="HTML")
+        target = game["chat_id"] if game["mode"] == "ls" else chat_id
+        try: await bot.send_message(target, f"🏆 <b>{html_mod.escape(winner)} выиграл!</b>", parse_mode="HTML")
         except Exception: pass
-        UNO_GAMES.pop(chat_id, None); return
+        UNO_GAMES.pop(game["chat_id"] if game["mode"] == "ls" else chat_id, None); return
 
     if game["mode"] == "group": await _uno_refresh_group(game, chat_id)
     for p in game["players"]:
@@ -1436,14 +1431,16 @@ async def _uno_bot(game, chat_id):
     hand = game["hands"].get("0", [])
     top = game["top"]; cur = game["current_color"]; diff = bp.get("difficulty", "medium")
     playable = [(i, c) for i, c in enumerate(hand) if _uno_can(c, top, cur)]
+    target = game["chat_id"] if game["mode"] == "ls" else chat_id
     if not playable:
         if game["deck"]: hand.append(game["deck"].pop())
         game["turn_idx"] = (game["turn_idx"] + game["direction"]) % len(game["players"])
-        try: await bot.send_message(game["chat_id"], "🤖 Бот взял карту.")
+        try: await bot.send_message(target, "🤖 Бот взял карту.")
         except Exception: pass
         for p in game["players"]:
             if p.get("is_bot"): continue
             await _uno_send_dm(p["id"], game)
+        # после сброса бот сразу не ходит, ход перешёл к игроку
         return
     if diff == "easy": pick = random.choice(playable)
     elif diff == "medium":
@@ -1468,19 +1465,20 @@ async def _uno_bot(game, chat_id):
     else: game["current_color"] = card["color"]
     try:
         sfx = f" → {game['current_color']}" if card["color"] == "🌈" else ""
-        await bot.send_message(game["chat_id"], f"🤖 Бот сбросил {_uno_label(card)}{sfx}")
+        await bot.send_message(target, f"🤖 Бот сбросил {_uno_label(card)}{sfx}")
     except Exception: pass
     await _uno_after(game, chat_id, 0, card)
 
 
-@dp.message(F.text.func(dot_starts(".uno")))
+# --- УНО в ЛС: и .uno, и /uno, и /uno@bot ---
+@dp.message(F.text.func(lambda t: _normalize_dot(t) in (".uno", "/uno", "uno")))
 async def cmd_uno_dot(message):
-    if message.chat.type in ("group", "supergroup", "channel"): return
+    if message.chat.type != "private": return
     await _try_delete_command(message)
     chat_id = message.chat.id
     if chat_id in UNO_GAMES:
         await message.answer("⚠️ Игра уже идёт. /cancel чтобы сбросить."); return
-    uid = message.from_user.id; name = message.from_user.full_name or "Ты"
+    uid = message.from_user.id
     d = _uno_diff(uid)
     b = InlineKeyboardBuilder()
     for k, label in DIFF_LABELS.items():
@@ -1488,7 +1486,8 @@ async def cmd_uno_dot(message):
         b.button(text=f"{mark}{label}", callback_data=f"uno_diff:{k}")
     b.row(InlineKeyboardButton(text="🚀 Начать", callback_data="uno_start_ls"))
     b.adjust(1)
-    await message.answer(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>", reply_markup=b.as_markup(), parse_mode="HTML")
+    await message.answer(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>",
+                          reply_markup=b.as_markup(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("uno_diff:"))
@@ -1502,7 +1501,8 @@ async def cb_uno_diff(cb):
         b.button(text=f"{mark}{label}", callback_data=f"uno_diff:{k}")
     b.row(InlineKeyboardButton(text="🚀 Начать", callback_data="uno_start_ls"))
     b.adjust(1)
-    try: await cb.message.edit_text(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>", reply_markup=b.as_markup(), parse_mode="HTML")
+    try: await cb.message.edit_text(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>",
+                                     reply_markup=b.as_markup(), parse_mode="HTML")
     except Exception: pass
     await cb.answer(DIFF_LABELS[d])
 
@@ -1523,33 +1523,13 @@ async def cb_uno_start_ls(cb):
     await _uno_send_dm(uid, game); await cb.answer("Погнали!")
 
 
-@dp.message(F.text.func(lambda t: t and _normalize_dot(t).startswith("/uno")))
-async def cmd_uno_group(message):
-    if message.chat.type == "private": return
-    await _try_delete_command(message)
-    chat_id = message.chat.id
-    if chat_id in UNO_GAMES and UNO_GAMES[chat_id].get("started"):
-        await message.answer("⚠️ Игра уже идёт."); return
-    args = (message.text or "").split()
-    no_timer = "notimer" in [a.lower() for a in args[1:]]
-    u = message.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
-    UNO_GAMES[chat_id] = {"mode": "group", "players": [{"id": u.id, "name": name}],
-                          "bc_id": message.business_connection_id, "no_timer": no_timer,
-                          "time_left": UNO_LOBBY_TIMEOUT, "started": False, "deck": [], "hands": {}}
-    game = UNO_GAMES[chat_id]
-    text = _uno_lobby_text(game)
-    b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="uno_join")
-    msg = await message.answer(text, reply_markup=b.as_markup(), parse_mode="HTML")
-    game["lobby_msg_id"] = msg.message_id
-    if not no_timer: asyncio.create_task(_uno_lobby_tick(chat_id))
-
-
 def _uno_lobby_text(game):
     players = game["players"]
     lines = ["🎴 <b>Набор в Уно</b>\n"]
     if players: lines.append(f"👥 ({len(players)}): " + ", ".join(html_mod.escape(p["name"]) for p in players))
-    if game.get("no_timer"): lines.append("\n⏸ Таймер отключён. Админ: <code>/play</code>")
+    if game.get("no_timer"): lines.append("\n⏸ Таймер отключён. Старт: <code>/play</code>")
     else: lines.append(f"\n⏱ Старт через <b>{game.get('time_left', UNO_LOBBY_TIMEOUT)}</b> сек.")
+    lines.append("\nМинимум 2 игрока.")
     return "\n".join(lines)
 
 
@@ -1569,6 +1549,27 @@ async def _uno_lobby_tick(chat_id):
             try: await bot.send_message(chat_id, "⏱ Время вышло. Жду <code>/play</code>.", parse_mode="HTML")
             except Exception: pass
             return
+
+
+# --- УНО в группе: /uno ---
+@dp.message(F.text.func(lambda t: t and _normalize_dot(t).startswith("/uno")))
+async def cmd_uno_group(message):
+    if message.chat.type == "private": return
+    await _try_delete_command(message)
+    chat_id = message.chat.id
+    if chat_id in UNO_GAMES and UNO_GAMES[chat_id].get("started"):
+        await message.answer("⚠️ Игра уже идёт."); return
+    args = (message.text or "").split()
+    no_timer = any(a.lower() == "notimer" for a in args[1:])
+    u = message.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
+    UNO_GAMES[chat_id] = {"mode": "group", "players": [{"id": u.id, "name": name}],
+                          "bc_id": message.business_connection_id, "no_timer": no_timer,
+                          "time_left": UNO_LOBBY_TIMEOUT, "started": False, "deck": [], "hands": {}}
+    game = UNO_GAMES[chat_id]
+    b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="uno_join")
+    msg = await message.answer(_uno_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+    game["lobby_msg_id"] = msg.message_id
+    if not no_timer: asyncio.create_task(_uno_lobby_tick(chat_id))
 
 
 @dp.callback_query(F.data == "uno_join")
@@ -1591,18 +1592,22 @@ async def cb_uno_join(cb):
 @dp.message(F.text == "/play")
 async def cmd_play(message):
     await _try_delete_command(message)
-    if not is_owner(message.from_user): await message.answer("Только владелец."); return
     chat_id = message.chat.id
     game = UNO_GAMES.get(chat_id)
-    if not game or game.get("started"): await message.answer("Нет лобби."); return
-    if len(game["players"]) < 2: await message.answer("⚠️ Нужно ≥2."); return
+    if not game or game.get("started"):
+        await message.answer("Нет активного лобби. Сначала <code>/uno</code>.", parse_mode="HTML"); return
+    creator = game["players"][0]["id"] if game.get("players") else None
+    if not (is_owner(message.from_user) or message.from_user.id == creator):
+        await message.answer("Стартовать может только создатель лобби или владелец."); return
+    if len(game["players"]) < 2: await message.answer("⚠️ Нужно ≥2 игрока."); return
     _uno_start_round(game)
-    try: await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"], text="🎴 <b>Уно началось!</b>", parse_mode="HTML")
+    try: await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
+                                      text="🎴 <b>Уно началось!</b>", parse_mode="HTML")
     except Exception: pass
     for p in game["players"]:
         try: await bot.send_message(p["id"], "🎴 Игра началась!")
         except Exception:
-            try: await bot.send_message(chat_id, f"⚠️ {html_mod.escape(p['name'])} — напиши боту в ЛС.")
+            try: await bot.send_message(chat_id, f"⚠️ {html_mod.escape(p['name'])} — напиши боту в ЛС /start.")
             except Exception: pass
     for p in game["players"]: await _uno_send_dm(p["id"], game)
     await _uno_refresh_group(game, chat_id)
@@ -1611,7 +1616,13 @@ async def cmd_play(message):
 @dp.callback_query(F.data.startswith("uno_play:"))
 async def cb_uno_play(cb):
     chat_id = cb.message.chat.id
+    # ищем игру: сначала как ЛС, потом как группа
     game = UNO_GAMES.get(chat_id)
+    if not game:
+        # возможно колбэк из ЛС, а игра привязана к ЛС chat_id
+        for cid, g in UNO_GAMES.items():
+            if g.get("mode") == "ls" and g.get("player_uid") == cb.from_user.id:
+                chat_id = cid; game = g; break
     if not game: await cb.answer("Нет игры", show_alert=True); return
     try: idx = int(cb.data.split(":", 1)[1])
     except: await cb.answer("Ошибка", show_alert=True); return
@@ -1659,7 +1670,8 @@ async def cb_uno_dm_draw(cb):
     card = game["deck"].pop(); game["hands"][str(uid)].append(card)
     game["turn_idx"] = (game["turn_idx"] + game["direction"]) % len(game["players"])
     await cb.answer(f"Взял {_uno_label(card)}")
-    try: await bot.send_message(chat_id if game["mode"] == "group" else game["chat_id"], "🎴 Игрок взял карту.")
+    target_chat = game["chat_id"] if game["mode"] == "ls" else chat_id
+    try: await bot.send_message(target_chat, "🎴 Игрок взял карту.")
     except Exception: pass
     for p in game["players"]:
         if p.get("is_bot"): continue
@@ -1712,6 +1724,7 @@ async def cb_uno_surrender(cb):
 async def cb_uno_noop(cb): await cb.answer()
 
 
+# ============ БИЗНЕС ============
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
     try:
@@ -1773,7 +1786,7 @@ async def bc_voice(message):
                 except Exception: pass
 
 
-# === HTTP-СЕРВЕР ДЛЯ HEALTHCHECK RELAXDEV ===
+# ============ HTTP-СЕРВЕР ДЛЯ HEALTHCHECK RELAXDEV ============
 async def _health(request):
     return web.Response(text="ok")
 
@@ -1808,8 +1821,8 @@ async def set_bot_commands():
         BotCommand(command="mykey", description="Мой ключ"),
         BotCommand(command="stickers", description="Стикерпаки"),
         BotCommand(command="whisper", description="Шёпот"),
-        BotCommand(command="uno", description="Уно (в группе)"),
-        BotCommand(command="play", description="Старт Уно"),
+        BotCommand(command="uno", description="Уно (в ЛС с ботом, в группе с людьми)"),
+        BotCommand(command="play", description="Старт Уно в группе"),
         BotCommand(command="cancel", description="Отмена"),
     ]
     try: await bot.set_my_commands(cmds)
