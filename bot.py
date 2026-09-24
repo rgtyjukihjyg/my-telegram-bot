@@ -24,13 +24,17 @@ try:
 except ImportError:
     HAS_GTTS = False
 
+
+# ================== КОНФИГ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN: raise ValueError("нет BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("нет BOT_TOKEN")
 STORAGE_CHAT_ID = os.environ.get("STORAGE_CHAT_ID")
 OWNER_ID = 7752398574
 OWNER_USERNAME = (os.environ.get("OWNER_USERNAME") or "vimbrix").lower().lstrip("@")
 _eid = os.environ.get("OWNER_ID")
-if _eid and _eid.strip().isdigit(): OWNER_ID = int(_eid)
+if _eid and _eid.strip().isdigit():
+    OWNER_ID = int(_eid)
 DATA_FILE = "data.json"
 KEY_LENGTH = 12
 KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -45,7 +49,8 @@ BTN_CREATE_KEY = "🔑 Создать ключ"
 BTN_KEYS_STATUS = "📋 Статусы ключей"
 
 _skw = {"timeout": 120}
-if PROXY: _skw["proxy"] = PROXY
+if PROXY:
+    _skw["proxy"] = PROXY
 session = AiohttpSession(**_skw)
 bot = Bot(token=BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -96,13 +101,11 @@ SPACE_RE = re.compile(r"\s+")
 
 
 def _cmd(t, *names):
-    """Универсальный фильтр команд. Ловит .cmd /cmd cmd .уно .гтщ, с пробелами и точкой в конце."""
     if not t: return False
     s = SPACE_RE.sub("", t.strip().lower()).rstrip(".!?,;:")
     return s in names
 
 
-# Кириллические пары для каждой dot-команды
 UNO_VARIANTS = (".uno", "/uno", "uno", ".уно", "/уно", "уно", ".гтщ", "/гтщ", "гтщ")
 RL_VARIANTS = (".rl", ".рулетка", "рулетка", ".ruletka", "/ruletka", "ruletka", ".кд", "кд")
 TTT_VARIANTS = (".ttt", "/ttt", ".еее", "/еее", ".ттт", "ттт")
@@ -298,10 +301,14 @@ def _is_dead_bc(bc_id): return bc_id in DATA.get("dead_bc", [])
 
 async def _try_delete_command(message, bc_id=None):
     try:
-        if bc_id:
-            await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[message.message_id])
-        else: await message.delete()
-    except Exception: pass
+        bc = bc_id or getattr(message, "business_connection_id", None)
+        if bc:
+            await bot.delete_business_messages(business_connection_id=bc,
+                                                message_ids=[message.message_id])
+        else:
+            await message.delete()
+    except Exception:
+        pass
 
 
 def _convert_layout(text):
@@ -464,19 +471,34 @@ def _stt_pipeline(src, wav):
     convert_to_wav(src, wav); return transcribe_wav(wav)
 
 
-async def _handle_stt(message, file_id, ext_hint=".ogg"):
+async def _handle_stt(message: Message, file_id, ext_hint=".ogg"):
     fi = await bot.get_file(file_id)
     src, wav = f"downloads/stt_{file_id}{ext_hint}", f"downloads/stt_{file_id}.wav"
     await bot.download_file(fi.file_path, src)
-    status = await message.answer("📝 Слушаю...")
+    bc = getattr(message, "business_connection_id", None)
+    if bc:
+        status = await bot.send_message(message.chat.id, "📝 Слушаю...", business_connection_id=bc)
+    else:
+        status = await message.answer("📝 Слушаю...")
     try:
         loop = asyncio.get_event_loop()
         text, _ = await loop.run_in_executor(None, _stt_pipeline, src, wav)
         preview = (text[:3900] if len(text) <= 3900 else text[:3900] + "...") or "🤷 Не разобрал."
-        await status.edit_text(f"📝 Расшифровка:\n\n{preview}")
+        new_text = f"📝 Расшифровка:\n\n{preview}"
+        if bc:
+            await bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
+                                         text=new_text, business_connection_id=bc)
+        else:
+            await status.edit_text(new_text)
     except Exception as e:
-        try: await status.edit_text(f"😔 {str(e)[:250]}")
-        except Exception: pass
+        try:
+            if bc:
+                await bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id,
+                                             text=f"😔 {str(e)[:250]}", business_connection_id=bc)
+            else:
+                await status.edit_text(f"😔 {str(e)[:250]}")
+        except Exception:
+            pass
     finally:
         for p in (src, wav):
             if os.path.exists(p):
@@ -488,35 +510,97 @@ def _tts_generate(text, out):
     gTTS(text=text, lang="ru").save(out); return out
 
 
-ALWAYS_FREE = {"/start", "/help", "/code", "/mykey", "/whoami", "/whisper", "/cancel", "/uno", "/play", "/mafia"}
+# ================== MONKEY-PATCH: business-ответы ==================
+_orig_answer = Message.answer
+_orig_answer_voice = Message.answer_voice
+_orig_reply = Message.reply
+
+
+async def _patched_answer(self, *args, **kwargs):
+    bc = getattr(self, "business_connection_id", None)
+    if bc and "business_connection_id" not in kwargs:
+        text = args[0] if args else kwargs.get("text", "")
+        new_kwargs = {k: v for k, v in kwargs.items() if k != "text"}
+        new_kwargs["business_connection_id"] = bc
+        try:
+            return await self.bot.send_message(self.chat.id, text, **new_kwargs)
+        except Exception as e:
+            print(f"biz answer fail: {str(e)[:150]}", flush=True)
+    return await _orig_answer(self, *args, **kwargs)
+
+
+async def _patched_answer_voice(self, *args, **kwargs):
+    bc = getattr(self, "business_connection_id", None)
+    if bc and "business_connection_id" not in kwargs:
+        voice = args[0] if args else kwargs.get("voice")
+        new_kwargs = {k: v for k, v in kwargs.items() if k != "voice"}
+        new_kwargs["business_connection_id"] = bc
+        try:
+            return await self.bot.send_voice(self.chat.id, voice, **new_kwargs)
+        except Exception as e:
+            print(f"biz answer_voice fail: {str(e)[:150]}", flush=True)
+    return await _orig_answer_voice(self, *args, **kwargs)
+
+
+async def _patched_reply(self, *args, **kwargs):
+    bc = getattr(self, "business_connection_id", None)
+    if bc:
+        kwargs.setdefault("reply_to_message_id", self.message_id)
+        return await _patched_answer(self, *args, **kwargs)
+    return await _orig_reply(self, *args, **kwargs)
+
+
+Message.answer = _patched_answer
+Message.answer_voice = _patched_answer_voice
+Message.reply = _patched_reply
+
+
+# ================== MIDDLEWARE ==================
+ALWAYS_FREE = {"/start", "/help", "/code", "/mykey", "/whoami", "/whisper", "/cancel",
+               "/uno", "/play", "/mafia", "/newkey", "/stickers"}
 
 
 class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        if not isinstance(event, Message): return await handler(event, data)
+        if not isinstance(event, Message):
+            return await handler(event, data)
         user = event.from_user
-        if user is None: return await handler(event, data)
+        if user is None:
+            return await handler(event, data)
         chat_id = event.chat.id if event.chat else None
+        bc = getattr(event, "business_connection_id", None)
         text = (getattr(event, "text", None) or "").strip()
         if text:
-            print(f"[MIDDLE] uid={user.id} type={event.chat.type} text={text[:50]!r}", flush=True)
-        if chat_id and chat_id in MUTED and user.id in MUTED[chat_id]:
-            if not is_owner(user):
-                try: await event.delete()
-                except Exception: pass
-                try: await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!")
-                except Exception: pass
-                return
+            print(f"[MIDDLE] uid={user.id} type={event.chat.type} biz={bool(bc)} text={text[:50]!r}",
+                  flush=True)
+        if chat_id and chat_id in MUTED and user.id in MUTED[chat_id] and not is_owner(user):
+            try:
+                if bc:
+                    await bot.delete_business_messages(business_connection_id=bc,
+                                                        message_ids=[event.message_id])
+                else:
+                    await event.delete()
+            except Exception: pass
+            try:
+                if bc:
+                    await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!", business_connection_id=bc)
+                else:
+                    await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!")
+            except Exception: pass
+            return
         if not text:
             return await handler(event, data)
         s = SPACE_RE.sub("", text.strip().lower()).rstrip(".!?,;:")
         if s.startswith("."):
             return await handler(event, data)
         cmd = text.split()[0].lower() if text else ""
-        if cmd in ALWAYS_FREE: return await handler(event, data)
-        if is_owner(user): return await handler(event, data)
+        if cmd in ALWAYS_FREE:
+            return await handler(event, data)
+        if is_owner(user):
+            return await handler(event, data)
         status = user_status(user.id)
-        if status == "valid": return await handler(event, data)
+        if status == "valid":
+            return await handler(event, data)
         if status == "expired":
             DATA["users"].pop(str(user.id), None); save_data(DATA)
             try: await event.answer("⏰ Ключ истёк. /code")
@@ -524,6 +608,36 @@ class AccessMiddleware(BaseMiddleware):
             return
         try: await event.answer("🔒 Доступ только по ключу.\n\n/code ТВОЙ_КЛЮЧ")
         except Exception: pass
+
+
+class BusinessHistoryMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if not isinstance(event, Message):
+            return await handler(event, data)
+        bc = getattr(event, "business_connection_id", None)
+        if not bc or _is_dead_bc(bc):
+            return await handler(event, data)
+        user = event.from_user
+        if not user:
+            return await handler(event, data)
+        try:
+            chat_id = event.chat.id
+            DATA.setdefault("business_chats", {})[str(chat_id)] = bc
+            owner_id = BUSINESS_CONNECTIONS.get(bc, {}).get("user_id") or \
+                       DATA.get("business_owners", {}).get(bc)
+            is_out = (owner_id is not None and user.id == owner_id)
+            text = event.text or event.caption or ""
+            if text.startswith(".") or text.startswith("/"):
+                text = ""
+            if text:
+                hist = DATA.setdefault("history", {}).setdefault(str(chat_id), [])
+                hist.append({"from_id": user.id, "text": text[:400],
+                             "ts": time.time(), "is_out": is_out})
+                if len(hist) > HISTORY_LIMIT:
+                    DATA["history"][str(chat_id)] = hist[-HISTORY_LIMIT:]
+        except Exception as e:
+            print(f"biz hist: {str(e)[:150]}", flush=True)
+        return await handler(event, data)
 
 
 async def try_activate_key(event, user, key):
@@ -618,26 +732,98 @@ def _revoke_by_keycode(code):
     return {"key": code, "used_by": ub}
 
 
+# ================== БАЗОВЫЕ КОМАНДЫ ==================
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
+    kb = owner_reply_kb() if is_owner(message.from_user) else None
+    await message.answer(
+        "👋 Привет!\n\n"
+        "🔑 <code>/code КЛЮЧ</code> — активировать доступ\n"
+        "📖 /help — список команд\n"
+        "ℹ️ /mykey — остаток ключа\n"
+        "❌ /cancel — отмена\n\n"
+        "🎮 .ttt · .uno · .rl · /mafia · .mute · .tts · .switch",
+        reply_markup=kb,
+    )
+
+
+@dp.message(F.text.func(lambda t: _cmd(t, *HELP_VARIANTS)))
+async def cmd_help(message: Message):
+    await message.answer(
+        "📖 <b>Команды</b>\n\n"
+        "🎮 <code>.ttt</code> — крестики-нолики\n"
+        "🎴 <code>.uno</code> — Уно против бота (ЛС)\n"
+        "🎴 <code>/uno</code> — Уно в группе\n"
+        "🎴 <code>/uno notimer</code> — лобби без таймера\n"
+        "🔫 <code>/mafia</code> — Мафия (группа)\n"
+        "🎲 <code>.rl</code> — рулетка\n"
+        "🔇 <code>.mute</code> (реплаем) — мут (владелец)\n"
+        "🔊 <code>.tts текст</code> — озвучка\n"
+        "🔁 <code>.switch</code> (реплаем) — сменить раскладку\n"
+        "🎤 голосовое — расшифровка в текст\n"
+        "🔑 <code>/code КЛЮЧ</code> — активировать ключ\n"
+        "ℹ️ /mykey · /whoami · /cancel"
+    )
+
+
+@dp.message(F.text.startswith("/code"))
+async def cmd_code(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("⚠️ <code>/code ТВОЙ_КЛЮЧ</code>", parse_mode="HTML")
+        return
+    await try_activate_key(message, message.from_user, parts[1].strip().upper())
+
+
+@dp.message(F.text == "/mykey")
+async def cmd_mykey(message: Message):
+    u = DATA["users"].get(str(message.from_user.id))
+    if not u:
+        await message.answer("🔒 Нет ключа. /code КЛЮЧ"); return
+    if u.get("permanent"):
+        await message.answer("♾ Ключ навсегда"); return
+    rem = max(0, u.get("expires_at", 0) - time.time())
+    await message.answer(f"⏳ Осталось: {format_duration(rem)}")
+
+
+@dp.message(F.text == "/whoami")
+async def cmd_whoami(message: Message):
+    u = message.from_user
+    st = user_status(u.id)
+    await message.answer(
+        f"🆔 <code>{u.id}</code>\n"
+        f"👤 @{u.username or '—'}\n"
+        f"🔑 Статус: <b>{st}</b>\n"
+        f"👑 Владелец: {'да' if is_owner(u) else 'нет'}"
+    )
+
+
+@dp.message(F.text == "/cancel")
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("✅ Отменено.")
+
+
 @dp.message(lambda m: m.text is not None and BTN_CREATE_KEY in m.text)
-async def btn_create_key(message):
+async def btn_create_key(message: Message):
     if not is_owner(message.from_user): return
     await _show_create_key_menu(message)
 
 
 @dp.message(lambda m: m.text is not None and BTN_KEYS_STATUS in m.text)
-async def btn_keys_status(message):
+async def btn_keys_status(message: Message):
     if not is_owner(message.from_user): return
     await _send_keys_list(message)
 
 
 @dp.message(F.text == "/newkey")
-async def cmd_newkey(message):
+async def cmd_newkey(message: Message):
     if not is_owner(message.from_user): return
     await _show_create_key_menu(message)
 
 
 @dp.callback_query(F.data == "kc:perm")
-async def cb_kc_perm(cb):
+async def cb_kc_perm(cb: CallbackQuery):
     if not is_owner(cb.from_user): await cb.answer("Не твоя", show_alert=True); return
     key = _generate_key()
     DATA["keys"][key] = {"permanent": True, "duration": 0, "created_at": time.time(), "used_by": None}
@@ -647,27 +833,31 @@ async def cb_kc_perm(cb):
 
 
 @dp.callback_query(F.data == "kc:temp")
-async def cb_kc_temp(cb, state):
+async def cb_kc_temp(cb: CallbackQuery, state: FSMContext):
     if not is_owner(cb.from_user): await cb.answer("Не твоя", show_alert=True); return
     await cb.message.edit_text("⏳ Формат: <code>1d 2h 30m</code>", parse_mode="HTML")
     await state.set_state(BotStates.waiting_for_duration); await cb.answer()
 
 
 @dp.message(BotStates.waiting_for_duration)
-async def process_duration(message, state):
+async def process_duration(message: Message, state: FSMContext):
     try:
         if not is_owner(message.from_user): return
         dur = parse_duration(message.text or "")
-        if not dur: await message.answer("🤔 Пример: <code>1d 2h 30m</code>", parse_mode="HTML"); return
+        if not dur:
+            await message.answer("🤔 Пример: <code>1d 2h 30m</code>", parse_mode="HTML"); return
         key = _generate_key()
-        DATA["keys"][key] = {"permanent": False, "duration": dur, "created_at": time.time(), "used_by": None}
+        DATA["keys"][key] = {"permanent": False, "duration": dur,
+                             "created_at": time.time(), "used_by": None}
         await save_data_sync(DATA)
-        await message.answer(f"⏳ <b>Ключ:</b> <code>{key}</code>\n⏱ {format_duration(dur)}", parse_mode="HTML")
-    finally: await state.clear()
+        await message.answer(f"⏳ <b>Ключ:</b> <code>{key}</code>\n⏱ {format_duration(dur)}",
+                             parse_mode="HTML")
+    finally:
+        await state.clear()
 
 
 @dp.callback_query(F.data.startswith("kdel:"))
-async def cb_key_delete(cb):
+async def cb_key_delete(cb: CallbackQuery):
     if not is_owner(cb.from_user): await cb.answer("Не твоя", show_alert=True); return
     code = cb.data.split(":", 1)[1].strip().upper()
     _revoke_by_keycode(code); await save_data_sync(DATA)
@@ -696,53 +886,60 @@ async def _do_revoke(message, arg=None):
         if info: await save_data_sync(DATA); await message.answer("✅ Отозван."); return
 
 
-# ============ РУЛЕТКА ============
+# ================== РУЛЕТКА ==================
 @dp.message(F.text.func(lambda t: _cmd(t, *RL_VARIANTS)))
-async def cmd_ruletka(message):
-    print(f"[rl] HIT text={message.text!r}", flush=True)
+async def cmd_ruletka(message: Message):
+    print(f"[rl] HIT text={message.text!r} biz={bool(message.business_connection_id)}", flush=True)
     await _try_delete_command(message)
     win = random.random() < 5/6
     await message.answer(random.choice(RULETKA_WIN if win else RULETKA_LOSE))
 
 
-# ============ ГОЛОСОВЫЕ ============
+# ================== ГОЛОСОВЫЕ ==================
 @dp.message(F.voice)
-async def process_voice(message, state):
-    await state.set_state(None); await _handle_stt(message, message.voice.file_id, ".ogg")
+async def process_voice(message: Message, state: FSMContext):
+    await state.set_state(None)
+    await _handle_stt(message, message.voice.file_id, ".ogg")
 
 
 @dp.message(F.video_note)
-async def process_video_note(message, state):
-    await state.set_state(None); await _handle_stt(message, message.video_note.file_id, ".mp4")
+async def process_video_note(message: Message, state: FSMContext):
+    await state.set_state(None)
+    await _handle_stt(message, message.video_note.file_id, ".mp4")
 
 
-# ============ SWITCH / TTS ============
+# ================== SWITCH / TTS ==================
 @dp.message(F.text.func(lambda t: _cmd(t, *SWITCH_VARIANTS)))
-async def cmd_switch(message):
+async def cmd_switch(message: Message):
     if message.chat.type in ("group", "supergroup", "channel"): return
     await _try_delete_command(message)
     if not message.reply_to_message:
         await message.answer("⚠️ Ответь на сообщение.", parse_mode="HTML"); return
     src = message.reply_to_message.text or message.reply_to_message.caption or ""
-    if not src.strip(): await message.answer("⚠️ Нет текста."); return
+    if not src.strip():
+        await message.answer("⚠️ Нет текста."); return
     conv, dr = _convert_layout(src)
-    if not dr or conv == src: await message.answer("🤷 Нечего менять."); return
-    await message.answer(f"🔁 <b>Исправлено:</b>\n\n{html_mod.escape(conv)}", parse_mode="HTML",
+    if not dr or conv == src:
+        await message.answer("🤷 Нечего менять."); return
+    await message.answer(f"🔁 <b>Исправлено:</b>\n\n{html_mod.escape(conv)}",
+                          parse_mode="HTML",
                           reply_to_message_id=message.reply_to_message.message_id)
 
 
 @dp.message(F.text.func(lambda t: _cmd(t, *TTS_VARIANTS)))
-async def cmd_tts(message):
+async def cmd_tts(message: Message):
     if message.chat.type in ("group", "supergroup", "channel"): return
     await _try_delete_command(message)
-    if not HAS_GTTS: await message.answer("❌ gTTS не установлен."); return
+    if not HAS_GTTS:
+        await message.answer("❌ gTTS не установлен."); return
     text = ""
     if message.reply_to_message:
         text = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
     else:
         parts = (message.text or "").split(maxsplit=1)
         if len(parts) > 1: text = parts[1].strip()
-    if not text: await message.answer("⚠️ <code>.tts текст</code>", parse_mode="HTML"); return
+    if not text:
+        await message.answer("⚠️ <code>.tts текст</code>", parse_mode="HTML"); return
     if len(text) > 500: text = text[:500]
     status = await message.answer("🔊 Генерирую...")
     out = f"downloads/tts_{int(time.time())}.mp3"
@@ -761,7 +958,7 @@ async def cmd_tts(message):
             except Exception: pass
 
 
-# ============ МУТ ============
+# ================== МУТ ==================
 def _target_from_msg(message):
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
@@ -769,7 +966,7 @@ def _target_from_msg(message):
 
 
 @dp.message(F.text.func(lambda t: _cmd(t, *UNMUTE_VARIANTS)))
-async def cmd_unmute(message):
+async def cmd_unmute(message: Message):
     await _try_delete_command(message)
     if not is_owner(message.from_user): return
     target = _target_from_msg(message)
@@ -781,7 +978,7 @@ async def cmd_unmute(message):
 
 
 @dp.message(F.text.func(lambda t: _cmd(t, *MUTE_VARIANTS)))
-async def cmd_mute(message):
+async def cmd_mute(message: Message):
     print(f"[mute] HIT text={message.text!r} owner={is_owner(message.from_user)}", flush=True)
     await _try_delete_command(message)
     if not is_owner(message.from_user): return
@@ -792,37 +989,43 @@ async def cmd_mute(message):
     MUTED.setdefault(message.chat.id, set()).add(target.id)
     name = target.full_name or str(target.id)
     await message.answer(f"🔇 <b>МОЛЧАТЬ!!!</b> {html_mod.escape(name)}", parse_mode="HTML")
-# ============ ШЁПОТ ============
+
+
+# ================== ШЁПОТ ==================
 def _next_whisper_id():
     c = int(DATA.get("whisper_counter", 1)); DATA["whisper_counter"] = c + 1; return c
 
 
 @dp.inline_query()
-async def inline_whisper(query):
+async def inline_whisper(query: InlineQuery):
     text = (query.query or "").strip()
     bot_uname = (await get_bot_username()).lower()
     if not text:
         result = InlineQueryResultArticle(id="h1", title="🤫 Напиши: текст @username",
             description="Например: привет @vimbrix",
-            input_message_content=InputTextMessageContent(message_text=f"🤫 <code>@{bot_uname} текст @username</code>", parse_mode="HTML"))
+            input_message_content=InputTextMessageContent(
+                message_text=f"🤫 <code>@{bot_uname} текст @username</code>", parse_mode="HTML"))
         await query.answer([result], cache_time=0, is_personal=True); return
     mentions = [m for m in re.finditer(r"@(\w+)", text) if m.group(1).lower() != bot_uname]
     if not mentions:
         result = InlineQueryResultArticle(id="h2", title="🤫 Добавь @username",
             description="Например: привет @vimbrix",
-            input_message_content=InputTextMessageContent(message_text=f"🤫 <code>@{bot_uname} текст @username</code>", parse_mode="HTML"))
+            input_message_content=InputTextMessageContent(
+                message_text=f"🤫 <code>@{bot_uname} текст @username</code>", parse_mode="HTML"))
         await query.answer([result], cache_time=0, is_personal=True); return
     tm = mentions[-1]; tuser = tm.group(1); wtext = text[:tm.start()].strip()
     if not wtext:
         result = InlineQueryResultArticle(id="h3", title="🤫 Что шептать?",
-            description="Напиши текст", input_message_content=InputTextMessageContent(message_text="🤫 Добавь текст."))
+            description="Напиши текст",
+            input_message_content=InputTextMessageContent(message_text="🤫 Добавь текст."))
         await query.answer([result], cache_time=0, is_personal=True); return
     tid = None
     for uid, ud in DATA["users"].items():
         if (ud.get("username") or "").lower() == tuser.lower(): tid = int(uid); break
     wid = _next_whisper_id()
     DATA["whispers"][str(wid)] = {"target_id": tid, "target_name": tuser, "text": wtext,
-        "from_id": query.from_user.id, "from_name": query.from_user.full_name, "expires": time.time() + WHISPER_TTL}
+        "from_id": query.from_user.id, "from_name": query.from_user.full_name,
+        "expires": time.time() + WHISPER_TTL}
     save_data(DATA)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👁 Прочитать", callback_data=f"whisper:{wid}")]])
@@ -834,9 +1037,9 @@ async def inline_whisper(query):
 
 
 @dp.callback_query(F.data.startswith("whisper:"))
-async def cb_whisper(cb):
+async def cb_whisper(cb: CallbackQuery):
     try: wid = int(cb.data.split(":", 1)[1])
-    except: await cb.answer("Сломался", show_alert=True); return
+    except Exception: await cb.answer("Сломался", show_alert=True); return
     w = DATA["whispers"].get(str(wid))
     if not w: await cb.answer("Улетел.", show_alert=True); return
     is_target = (w.get("target_id") is not None and cb.from_user.id == w["target_id"]) or \
@@ -854,10 +1057,11 @@ async def cb_whisper(cb):
         else:
             try: await bot.send_message(cb.from_user.id, f"🤫 от {w['from_name']}:\n\n{txt}"); await cb.answer("📩")
             except Exception: await cb.answer(f"🤫 {txt[:180]}...", show_alert=True)
-    else: await cb.answer(random.choice(FUNNY_REPLIES), show_alert=True)
+    else:
+        await cb.answer(random.choice(FUNNY_REPLIES), show_alert=True)
 
 
-# ============ КРЕСТИКИ-НОЛИКИ ============
+# ================== КРЕСТИКИ-НОЛИКИ ==================
 TTT_WIN_LINES = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
 
 
@@ -867,8 +1071,11 @@ def _ttt_text(game):
         v = board[i]
         return "❌" if v == "X" else ("⭕" if v == "O" else "▫️")
     grid = f"{cell(0)} {cell(1)} {cell(2)}\n{cell(3)} {cell(4)} {cell(5)}\n{cell(6)} {cell(7)} {cell(8)}"
-    footer = game.get("footer", "") if game.get("finished") else f"Ход: {'❌' if game['turn']=='x' else '⭕'}"
-    return f"❌⭕ <b>Крестики-нолики</b>\n\n❌ {html_mod.escape(game['names'].get('x','?'))}\n⭕ {html_mod.escape(game['names'].get('o','ждём...'))}\n\n{grid}\n\n{footer}"
+    footer = game.get("footer", "") if game.get("finished") else \
+             f"Ход: {'❌' if game['turn']=='x' else '⭕'}"
+    return (f"❌⭕ <b>Крестики-нолики</b>\n\n"
+            f"❌ {html_mod.escape(game['names'].get('x','?'))}\n"
+            f"⭕ {html_mod.escape(game['names'].get('o','ждём...'))}\n\n{grid}\n\n{footer}")
 
 
 def _ttt_kb(game):
@@ -880,15 +1087,18 @@ def _ttt_kb(game):
         if board[i] is None and not game.get("finished"):
             row.append(InlineKeyboardButton(text="⬜", callback_data=f"ttt_move:{i}"))
         else:
-            row.append(InlineKeyboardButton(text="❌" if board[i]=="X" else ("⭕" if board[i]=="O" else "⬜"), callback_data="ttt_noop"))
+            row.append(InlineKeyboardButton(
+                text="❌" if board[i]=="X" else ("⭕" if board[i]=="O" else "⬜"),
+                callback_data="ttt_noop"))
         if len(row) == 3: b.row(*row); row = []
     b.row(InlineKeyboardButton(text="🏳️ Сдаться", callback_data="ttt_reset"))
     return b.as_markup()
 
 
 @dp.message(F.text.func(lambda t: _cmd(t, *TTT_VARIANTS)))
-async def cmd_ttt(message, state):
-    print(f"[ttt] HIT text={message.text!r} chat={message.chat.id}", flush=True)
+async def cmd_ttt(message: Message, state: FSMContext):
+    print(f"[ttt] HIT text={message.text!r} chat={message.chat.id} biz={bool(message.business_connection_id)}",
+          flush=True)
     await state.clear()
     await _try_delete_command(message)
     chat_id = message.chat.id
@@ -899,11 +1109,12 @@ async def cmd_ttt(message, state):
     TTT_GAMES[chat_id] = {"board": [None]*9, "x_id": u.id, "o_id": None, "turn": "x",
                           "names": {"x": name, "o": None}, "finished": False, "footer": "",
                           "bc_id": message.business_connection_id}
-    await message.answer(_ttt_text(TTT_GAMES[chat_id]), reply_markup=_ttt_kb(TTT_GAMES[chat_id]), parse_mode="HTML")
+    await message.answer(_ttt_text(TTT_GAMES[chat_id]),
+                         reply_markup=_ttt_kb(TTT_GAMES[chat_id]), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "ttt_join")
-async def cb_ttt_join(cb):
+async def cb_ttt_join(cb: CallbackQuery):
     chat_id = cb.message.chat.id; game = TTT_GAMES.get(chat_id)
     if not game: await cb.answer("Не найдена", show_alert=True); return
     if game["finished"] or game.get("o_id"): await cb.answer("Занято", show_alert=True); return
@@ -912,20 +1123,21 @@ async def cb_ttt_join(cb):
     game["o_id"] = u.id; game["names"]["o"] = name
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=cb.message.message_id,
-                                     text=_ttt_text(game), reply_markup=_ttt_kb(game), parse_mode="HTML")
+                                     text=_ttt_text(game), reply_markup=_ttt_kb(game),
+                                     parse_mode="HTML")
     except Exception: pass
     await cb.answer("Погнали!")
 
 
 @dp.callback_query(F.data.startswith("ttt_move:"))
-async def cb_ttt_move(cb):
+async def cb_ttt_move(cb: CallbackQuery):
     chat_id = cb.message.chat.id; game = TTT_GAMES.get(chat_id)
     if not game or game["finished"]: await cb.answer("Недоступно", show_alert=True); return
     if not game.get("o_id"): await cb.answer("Ждём игрока", show_alert=True); return
     turn = game["turn"]; expected = game["x_id"] if turn == "x" else game["o_id"]
     if cb.from_user.id != expected: await cb.answer("Не твой ход", show_alert=True); return
     try: idx = int(cb.data.split(":", 1)[1])
-    except: await cb.answer("Ошибка", show_alert=True); return
+    except Exception: await cb.answer("Ошибка", show_alert=True); return
     if idx < 0 or idx > 8 or game["board"][idx] is not None:
         await cb.answer("Занято", show_alert=True); return
     game["board"][idx] = "X" if turn == "x" else "O"
@@ -940,13 +1152,14 @@ async def cb_ttt_move(cb):
     else: game["turn"] = "o" if turn == "x" else "x"
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=cb.message.message_id,
-                                     text=_ttt_text(game), reply_markup=_ttt_kb(game), parse_mode="HTML")
+                                     text=_ttt_text(game), reply_markup=_ttt_kb(game),
+                                     parse_mode="HTML")
     except Exception: pass
     await cb.answer()
 
 
 @dp.callback_query(F.data == "ttt_reset")
-async def cb_ttt_reset(cb):
+async def cb_ttt_reset(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     if chat_id in TTT_GAMES: TTT_GAMES.pop(chat_id, None)
     try: await cb.message.delete()
@@ -955,10 +1168,10 @@ async def cb_ttt_reset(cb):
 
 
 @dp.callback_query(F.data == "ttt_noop")
-async def cb_ttt_noop(cb): await cb.answer()
+async def cb_ttt_noop(cb: CallbackQuery): await cb.answer()
 
 
-# ============ УНО ============
+# ================== УНО ==================
 UNO_COLORS = ["🔴", "🔵", "🟢", "🟡"]
 COLOR_NAMES = {"🔴": "красный", "🔵": "синий", "🟢": "зелёный", "🟡": "жёлтый", "🌈": "wild"}
 NUM_EMOJI = {0:"0️⃣",1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣",7:"7️⃣",8:"8️⃣",9:"9️⃣"}
@@ -1024,7 +1237,8 @@ def _uno_start_round(game):
 def _uno_group_text(game):
     top = game["top"]; cur = game["current_color"]
     turn_p = game["players"][game["turn_idx"]]
-    lines = [f"🎴 <b>Уно</b>\n", f"🎯 Верхняя: {_uno_label(top)}", f"🎨 Цвет: {cur} {COLOR_NAMES.get(cur,'')}\n", "👥 Игроки:"]
+    lines = ["🎴 <b>Уно</b>\n", f"🎯 Верхняя: {_uno_label(top)}",
+             f"🎨 Цвет: {cur} {COLOR_NAMES.get(cur,'')}\n", "👥 Игроки:"]
     for p in game["players"]:
         cnt = len(game["hands"].get(str(p["id"]), []))
         mark = "👈 " if p["id"] == turn_p["id"] else ""
@@ -1047,7 +1261,6 @@ def _uno_dm_text(game, uid):
     hand = game["hands"].get(str(uid), [])
     top = game["top"]; cur = game["current_color"]
     is_turn = game["players"][game["turn_idx"]]["id"] == uid
-
     counts = []
     for p in game["players"]:
         cnt = len(game["hands"].get(str(p["id"]), []))
@@ -1055,14 +1268,11 @@ def _uno_dm_text(game, uid):
         bot_tag = " 🤖" if p.get("is_bot") else ""
         counts.append(f"{mark}{html_mod.escape(p['name'])}{bot_tag}: <b>{cnt}</b>")
     counts_line = " | ".join(counts)
-
     txt = (f"🎯 Верхняя: {_uno_label(top)}\n"
            f"🎨 Цвет: {cur} {COLOR_NAMES.get(cur,'')}\n\n"
            f"👥 Счёт: {counts_line}\n\n")
-    if is_turn:
-        txt += "✅ <b>Твой ход!</b>\n\n"
-    else:
-        txt += f"⏳ Ждём: <b>{html_mod.escape(game['players'][game['turn_idx']]['name'])}</b>\n\n"
+    if is_turn: txt += "✅ <b>Твой ход!</b>\n\n"
+    else: txt += f"⏳ Ждём: <b>{html_mod.escape(game['players'][game['turn_idx']]['name'])}</b>\n\n"
     txt += f"🃏 <b>Твоя рука ({len(hand)}):</b>\n"
     return txt
 
@@ -1074,7 +1284,8 @@ def _uno_dm_kb(game, uid):
     b = InlineKeyboardBuilder(); row = []
     for i, c in enumerate(hand):
         ok = _uno_can(c, top, cur) and is_turn
-        row.append(InlineKeyboardButton(text=_uno_label(c), callback_data=f"uno_play:{i}" if ok else "uno_noop"))
+        row.append(InlineKeyboardButton(text=_uno_label(c),
+                                         callback_data=f"uno_play:{i}" if ok else "uno_noop"))
         if len(row) == 4: b.row(*row); row = []
     if row: b.row(*row)
     if is_turn: b.row(InlineKeyboardButton(text="🃏 Взять карту", callback_data="uno_dm_draw"))
@@ -1082,15 +1293,19 @@ def _uno_dm_kb(game, uid):
 
 
 async def _uno_send_dm(uid, game):
-    try: await bot.send_message(uid, _uno_dm_text(game, uid), reply_markup=_uno_dm_kb(game, uid), parse_mode="HTML")
-    except Exception as e: print(f"[uno dm {uid}] {str(e)[:120]}", flush=True)
+    try:
+        await bot.send_message(uid, _uno_dm_text(game, uid),
+                               reply_markup=_uno_dm_kb(game, uid), parse_mode="HTML")
+    except Exception as e:
+        print(f"[uno dm {uid}] {str(e)[:120]}", flush=True)
 
 
 async def _uno_refresh_group(game, chat_id):
     text = _uno_group_text(game); kb = _uno_group_kb()
     msg_id = game.get("group_msg_id")
     try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb, parse_mode="HTML")
+        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text,
+                                     reply_markup=kb, parse_mode="HTML")
     except Exception:
         try:
             m = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
@@ -1114,14 +1329,13 @@ async def _uno_after(game, chat_id, uid, card):
         game["turn_idx"] = nxt
     else:
         game["turn_idx"] = (game["turn_idx"] + game["direction"]) % n
-
     if not game["hands"].get(str(uid)):
         winner = next((p["name"] for p in game["players"] if p["id"] == uid), "?")
         target = game["chat_id"] if game["mode"] == "ls" else chat_id
-        try: await bot.send_message(target, f"🏆 <b>{html_mod.escape(winner)} выиграл!</b>", parse_mode="HTML")
+        try: await bot.send_message(target, f"🏆 <b>{html_mod.escape(winner)} выиграл!</b>",
+                                     parse_mode="HTML")
         except Exception: pass
         UNO_GAMES.pop(game["chat_id"] if game["mode"] == "ls" else chat_id, None); return
-
     if game["mode"] == "group": await _uno_refresh_group(game, chat_id)
     for p in game["players"]:
         if p.get("is_bot"): continue
@@ -1139,21 +1353,18 @@ async def _uno_bot(game, chat_id):
     top = game["top"]; cur = game["current_color"]; diff = bp.get("difficulty", "medium")
     playable = [(i, c) for i, c in enumerate(hand) if _uno_can(c, top, cur)]
     target = game["chat_id"] if game["mode"] == "ls" else chat_id
-
     if not playable:
         if game["deck"]: hand.append(game["deck"].pop())
         game["turn_idx"] = (game["turn_idx"] + game["direction"]) % len(game["players"])
         try:
             await bot.send_message(target,
-                f"🤖 <b>Бот взял карту.</b>\n"
-                f"Теперь у бота <b>{len(hand)}</b> карт.",
+                f"🤖 <b>Бот взял карту.</b>\nТеперь у бота <b>{len(hand)}</b> карт.",
                 parse_mode="HTML")
         except Exception: pass
         for p in game["players"]:
             if p.get("is_bot"): continue
             await _uno_send_dm(p["id"], game)
         return
-
     if diff == "easy": pick = random.choice(playable)
     elif diff == "medium":
         normals = [(i, c) for i, c in playable if c["color"] != "🌈"]
@@ -1164,10 +1375,11 @@ async def _uno_bot(game, chat_id):
             if c["color"] != "🌈": cc[c["color"]] = cc.get(c["color"], 0) + 1
         score = []
         for i, c in playable:
-            s = 100 if c["type"]=="wild4" else 80 if c["type"]=="draw2" else 60 if c["type"]=="skip" else 50 if c["type"]=="reverse" else 40 if c["type"]=="wild" else 10 + cc.get(c["color"],0)
+            s = (100 if c["type"]=="wild4" else 80 if c["type"]=="draw2" else
+                 60 if c["type"]=="skip" else 50 if c["type"]=="reverse" else
+                 40 if c["type"]=="wild" else 10 + cc.get(c["color"], 0))
             score.append((s, i, c))
         score.sort(reverse=True); pick = (score[0][1], score[0][2])
-
     idx, card = pick
     hand.pop(idx); game["top"] = card
     if card["color"] == "🌈":
@@ -1177,24 +1389,25 @@ async def _uno_bot(game, chat_id):
         game["current_color"] = max(cc, key=cc.get) if (diff == "hard" and cc) else random.choice(UNO_COLORS)
     else:
         game["current_color"] = card["color"]
-
     try:
         sfx = f" → цвет <b>{game['current_color']}</b>" if card["color"] == "🌈" else ""
         left = len(hand)
         uno_warn = " 📣 <b>УНО!</b>" if left == 1 else ""
         await bot.send_message(target,
-            f"🤖 <b>Бот сбросил {_uno_label(card)}</b>{sfx}\n"
-            f"У бота осталось <b>{left}</b> карт.{uno_warn}",
+            f"🤖 <b>Бот сбросил {_uno_label(card)}</b>{sfx}\nУ бота осталось <b>{left}</b> карт.{uno_warn}",
             parse_mode="HTML")
     except Exception: pass
     await _uno_after(game, chat_id, 0, card)
 
 
 @dp.message(F.text.func(lambda t: _cmd(t, *UNO_VARIANTS)))
-async def cmd_uno_dot(message, state):
-    print(f"[uno] HIT text={message.text!r} type={message.chat.type}", flush=True)
+async def cmd_uno_dot(message: Message, state: FSMContext):
+    print(f"[uno] HIT text={message.text!r} type={message.chat.type} biz={bool(message.business_connection_id)}",
+          flush=True)
     await state.clear()
-    if message.chat.type != "private": return
+    # в группах маршрутизируем в групповой обработчик (см. cmd_uno_mafia_group через /uno)
+    if message.chat.type != "private":
+        return
     await _try_delete_command(message)
     chat_id = message.chat.id
     if chat_id in UNO_GAMES:
@@ -1212,7 +1425,7 @@ async def cmd_uno_dot(message, state):
 
 
 @dp.callback_query(F.data.startswith("uno_diff:"))
-async def cb_uno_diff(cb):
+async def cb_uno_diff(cb: CallbackQuery):
     d = cb.data.split(":", 1)[1]
     if d not in DIFF_LABELS: await cb.answer("Ошибка", show_alert=True); return
     _uno_set_diff(cb.from_user.id, d)
@@ -1222,14 +1435,15 @@ async def cb_uno_diff(cb):
         b.button(text=f"{mark}{label}", callback_data=f"uno_diff:{k}")
     b.row(InlineKeyboardButton(text="🚀 Начать", callback_data="uno_start_ls"))
     b.adjust(1)
-    try: await cb.message.edit_text(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>",
-                                     reply_markup=b.as_markup(), parse_mode="HTML")
+    try:
+        await cb.message.edit_text(f"🎴 <b>Уно против бота</b>\n\nСложность: <b>{DIFF_LABELS[d]}</b>",
+                                    reply_markup=b.as_markup(), parse_mode="HTML")
     except Exception: pass
     await cb.answer(DIFF_LABELS[d])
 
 
 @dp.callback_query(F.data == "uno_start_ls")
-async def cb_uno_start_ls(cb):
+async def cb_uno_start_ls(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     if chat_id in UNO_GAMES: await cb.answer("Уже идёт", show_alert=True); return
     uid = cb.from_user.id; name = cb.from_user.full_name or "Ты"; d = _uno_diff(uid)
@@ -1247,7 +1461,8 @@ async def cb_uno_start_ls(cb):
 def _uno_lobby_text(game):
     players = game["players"]
     lines = ["🎴 <b>Набор в Уно</b>\n"]
-    if players: lines.append(f"👥 ({len(players)}): " + ", ".join(html_mod.escape(p["name"]) for p in players))
+    if players:
+        lines.append(f"👥 ({len(players)}): " + ", ".join(html_mod.escape(p["name"]) for p in players))
     if game.get("no_timer"): lines.append("\n⏸ Таймер отключён. Старт: <code>/play</code>")
     else: lines.append(f"\n⏱ Старт через <b>{game.get('time_left', UNO_LOBBY_TIMEOUT)}</b> сек.")
     lines.append("\nМинимум 2 игрока.")
@@ -1264,16 +1479,18 @@ async def _uno_lobby_tick(chat_id):
         b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="uno_join")
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
-                                         text=_uno_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+                                         text=_uno_lobby_text(game),
+                                         reply_markup=b.as_markup(), parse_mode="HTML")
         except Exception: pass
         if game["time_left"] <= 0:
-            try: await bot.send_message(chat_id, "⏱ Время вышло. Жду <code>/play</code>.", parse_mode="HTML")
+            try: await bot.send_message(chat_id, "⏱ Время вышло. Жду <code>/play</code>.",
+                                         parse_mode="HTML")
             except Exception: pass
             return
 
 
-@dp.message(F.text.func(lambda t: t and (t.strip().startswith("/uno") or t.strip().startswith("/мафия") or t.strip().startswith("/mafia"))))
-async def cmd_uno_mafia_group(message, state):
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(("/uno", "/мафия", "/mafia"))))
+async def cmd_uno_mafia_group(message: Message, state: FSMContext):
     if message.chat.type == "private": return
     txt = (message.text or "").strip().lower()
     if txt.startswith("/uno"):
@@ -1287,7 +1504,8 @@ async def cmd_uno_mafia_group(message, state):
         u = message.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
         UNO_GAMES[chat_id] = {"mode": "group", "players": [{"id": u.id, "name": name}],
                               "bc_id": message.business_connection_id, "no_timer": no_timer,
-                              "time_left": UNO_LOBBY_TIMEOUT, "started": False, "deck": [], "hands": {}}
+                              "time_left": UNO_LOBBY_TIMEOUT, "started": False,
+                              "deck": [], "hands": {}}
         game = UNO_GAMES[chat_id]
         b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="uno_join")
         msg = await message.answer(_uno_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
@@ -1296,24 +1514,26 @@ async def cmd_uno_mafia_group(message, state):
 
 
 @dp.callback_query(F.data == "uno_join")
-async def cb_uno_join(cb):
+async def cb_uno_join(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     game = UNO_GAMES.get(chat_id)
     if not game or game.get("started"): await cb.answer("Игра идёт", show_alert=True); return
     uid = cb.from_user.id
-    if any(p["id"] == uid for p in game["players"]): await cb.answer("Ты уже тут", show_alert=True); return
+    if any(p["id"] == uid for p in game["players"]):
+        await cb.answer("Ты уже тут", show_alert=True); return
     u = cb.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
     game["players"].append({"id": uid, "name": name})
     b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="uno_join")
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
-                                     text=_uno_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+                                     text=_uno_lobby_text(game), reply_markup=b.as_markup(),
+                                     parse_mode="HTML")
     except Exception: pass
     await cb.answer("Зашёл!")
 
 
 @dp.message(F.text == "/play")
-async def cmd_play(message, state):
+async def cmd_play(message: Message, state: FSMContext):
     await state.clear()
     await _try_delete_command(message)
     chat_id = message.chat.id
@@ -1323,10 +1543,12 @@ async def cmd_play(message, state):
     creator = game["players"][0]["id"] if game.get("players") else None
     if not (is_owner(message.from_user) or message.from_user.id == creator):
         await message.answer("Стартовать может только создатель лобби или владелец."); return
-    if len(game["players"]) < 2: await message.answer("⚠️ Нужно ≥2 игрока."); return
+    if len(game["players"]) < 2:
+        await message.answer("⚠️ Нужно ≥2 игрока."); return
     _uno_start_round(game)
-    try: await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
-                                      text="🎴 <b>Уно началось!</b>", parse_mode="HTML")
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
+                                     text="🎴 <b>Уно началось!</b>", parse_mode="HTML")
     except Exception: pass
     for p in game["players"]:
         try: await bot.send_message(p["id"], "🎴 Игра началась!")
@@ -1338,7 +1560,7 @@ async def cmd_play(message, state):
 
 
 @dp.callback_query(F.data.startswith("uno_play:"))
-async def cb_uno_play(cb):
+async def cb_uno_play(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     game = UNO_GAMES.get(chat_id)
     if not game:
@@ -1347,9 +1569,10 @@ async def cb_uno_play(cb):
                 chat_id = cid; game = g; break
     if not game: await cb.answer("Нет игры", show_alert=True); return
     try: idx = int(cb.data.split(":", 1)[1])
-    except: await cb.answer("Ошибка", show_alert=True); return
+    except Exception: await cb.answer("Ошибка", show_alert=True); return
     uid = cb.from_user.id
-    if game["players"][game["turn_idx"]]["id"] != uid: await cb.answer("Не твой ход", show_alert=True); return
+    if game["players"][game["turn_idx"]]["id"] != uid:
+        await cb.answer("Не твой ход", show_alert=True); return
     hand = game["hands"].get(str(uid), [])
     if idx < 0 or idx >= len(hand): await cb.answer("Нет карты", show_alert=True); return
     card = hand[idx]; top = game["top"]; cur = game["current_color"]
@@ -1367,7 +1590,7 @@ async def cb_uno_play(cb):
 
 
 @dp.callback_query(F.data.startswith("uno_color:"))
-async def cb_uno_color(cb):
+async def cb_uno_color(cb: CallbackQuery):
     color = cb.data.split(":", 1)[1]; uid = cb.from_user.id
     target = next(((cid, g) for cid, g in UNO_GAMES.items() if g.get("pending_uid") == uid), None)
     if not target: await cb.answer("Неактуально", show_alert=True); return
@@ -1380,14 +1603,15 @@ async def cb_uno_color(cb):
 
 
 @dp.callback_query(F.data == "uno_dm_draw")
-async def cb_uno_dm_draw(cb):
+async def cb_uno_dm_draw(cb: CallbackQuery):
     uid = cb.from_user.id
     target = next(((cid, g) for cid, g in UNO_GAMES.items()
                    if (g["mode"] == "ls" and g.get("player_uid") == uid) or
                       (g["mode"] == "group" and uid in [p["id"] for p in g["players"]])), None)
     if not target: await cb.answer("Нет игры", show_alert=True); return
     chat_id, game = target
-    if game["players"][game["turn_idx"]]["id"] != uid: await cb.answer("Не твой ход", show_alert=True); return
+    if game["players"][game["turn_idx"]]["id"] != uid:
+        await cb.answer("Не твой ход", show_alert=True); return
     if not game["deck"]: await cb.answer("Колода пуста", show_alert=True); return
     card = game["deck"].pop(); game["hands"][str(uid)].append(card)
     game["turn_idx"] = (game["turn_idx"] + game["direction"]) % len(game["players"])
@@ -1399,15 +1623,17 @@ async def cb_uno_dm_draw(cb):
         if p.get("is_bot"): continue
         await _uno_send_dm(p["id"], game)
     cur = game["players"][game["turn_idx"]]
-    if cur.get("is_bot"): await asyncio.sleep(1.5); await _uno_bot(game, chat_id)
+    if cur.get("is_bot"):
+        await asyncio.sleep(1.5); await _uno_bot(game, chat_id)
 
 
 @dp.callback_query(F.data == "uno_grp_draw")
-async def cb_uno_grp_draw(cb):
+async def cb_uno_grp_draw(cb: CallbackQuery):
     chat_id = cb.message.chat.id; game = UNO_GAMES.get(chat_id)
     if not game: await cb.answer("Нет игры", show_alert=True); return
     uid = cb.from_user.id
-    if game["players"][game["turn_idx"]]["id"] != uid: await cb.answer("Не твой ход", show_alert=True); return
+    if game["players"][game["turn_idx"]]["id"] != uid:
+        await cb.answer("Не твой ход", show_alert=True); return
     if not game["deck"]: await cb.answer("Колода пуста", show_alert=True); return
     card = game["deck"].pop(); game["hands"][str(uid)].append(card)
     game["turn_idx"] = (game["turn_idx"] + game["direction"]) % len(game["players"])
@@ -1418,14 +1644,15 @@ async def cb_uno_grp_draw(cb):
 
 
 @dp.callback_query(F.data == "uno_shout")
-async def cb_uno_shout(cb):
+async def cb_uno_shout(cb: CallbackQuery):
     chat_id = cb.message.chat.id; game = UNO_GAMES.get(chat_id)
     if not game: await cb.answer("Нет игры", show_alert=True); return
     uid = cb.from_user.id
     hand = game["hands"].get(str(uid), [])
     if len(hand) == 1:
         name = next((p["name"] for p in game["players"] if p["id"] == uid), "?")
-        try: await bot.send_message(chat_id, f"📣 <b>{html_mod.escape(name)}</b> крикнул УНО!", parse_mode="HTML")
+        try: await bot.send_message(chat_id, f"📣 <b>{html_mod.escape(name)}</b> крикнул УНО!",
+                                     parse_mode="HTML")
         except Exception: pass
         await cb.answer("📣")
     elif len(hand) > 1: await cb.answer("Уно только с 1 картой!", show_alert=True)
@@ -1433,7 +1660,7 @@ async def cb_uno_shout(cb):
 
 
 @dp.callback_query(F.data == "uno_surrender")
-async def cb_uno_surrender(cb):
+async def cb_uno_surrender(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     if chat_id in UNO_GAMES:
         UNO_GAMES.pop(chat_id, None)
@@ -1443,10 +1670,10 @@ async def cb_uno_surrender(cb):
 
 
 @dp.callback_query(F.data == "uno_noop")
-async def cb_uno_noop(cb): await cb.answer()
+async def cb_uno_noop(cb: CallbackQuery): await cb.answer()
 
 
-# ============ МАФИЯ ============
+# ================== МАФИЯ ==================
 ROLES = {"mafia": "🔫 Мафия", "doctor": "💊 Доктор", "detective": "🔍 Комиссар", "civilian": "👤 Мирный"}
 MAFIA_MIN = 4
 
@@ -1480,16 +1707,18 @@ async def _mafia_lobby_tick(chat_id):
         b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="mafia_join")
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
-                                         text=_mafia_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+                                         text=_mafia_lobby_text(game),
+                                         reply_markup=b.as_markup(), parse_mode="HTML")
         except Exception: pass
         if game["time_left"] <= 0:
-            try: await bot.send_message(chat_id, "⏱ Время вышло. Жду <code>/play</code>.", parse_mode="HTML")
+            try: await bot.send_message(chat_id, "⏱ Время вышло. Жду <code>/play</code>.",
+                                         parse_mode="HTML")
             except Exception: pass
             return
 
 
-@dp.message(F.text.func(lambda t: t and (t.strip().lower().startswith("/mafia") or t.strip().lower().startswith("/мафия"))))
-async def cmd_mafia(message, state):
+@dp.message(F.text.func(lambda t: t and t.strip().lower().startswith(("/mafia", "/мафия"))))
+async def cmd_mafia(message: Message, state: FSMContext):
     await state.clear()
     if message.chat.type == "private":
         await message.answer("🔫 Мафия только в группах."); return
@@ -1511,19 +1740,22 @@ async def cmd_mafia(message, state):
 
 
 @dp.callback_query(F.data == "mafia_join")
-async def cb_mafia_join(cb):
+async def cb_mafia_join(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     game = MAFIA_GAMES.get(chat_id)
-    if not game or game.get("state") != "lobby": await cb.answer("Лобби закрыто", show_alert=True); return
+    if not game or game.get("state") != "lobby":
+        await cb.answer("Лобби закрыто", show_alert=True); return
     uid = cb.from_user.id
-    if any(p["id"] == uid for p in game["players"]): await cb.answer("Ты уже тут", show_alert=True); return
+    if any(p["id"] == uid for p in game["players"]):
+        await cb.answer("Ты уже тут", show_alert=True); return
     if len(game["players"]) >= 10: await cb.answer("Максимум 10", show_alert=True); return
     u = cb.from_user; name = u.full_name or (f"@{u.username}" if u.username else "Игрок")
     game["players"].append({"id": uid, "name": name, "alive": True, "role": None})
     b = InlineKeyboardBuilder(); b.button(text="🙋 Присоединиться", callback_data="mafia_join")
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=game["lobby_msg_id"],
-                                     text=_mafia_lobby_text(game), reply_markup=b.as_markup(), parse_mode="HTML")
+                                     text=_mafia_lobby_text(game), reply_markup=b.as_markup(),
+                                     parse_mode="HTML")
     except Exception: pass
     await cb.answer("Зашёл!")
 
@@ -1539,7 +1771,8 @@ async def _mafia_start(chat_id):
     except Exception: pass
     for p in game["players"]:
         try:
-            await bot.send_message(p["id"], f"🔫 Твоя роль: <b>{ROLES[p['role']]}</b>\n\nИгра началась!", parse_mode="HTML")
+            await bot.send_message(p["id"], f"🔫 Твоя роль: <b>{ROLES[p['role']]}</b>\n\nИгра началась!",
+                                    parse_mode="HTML")
         except Exception:
             try: await bot.send_message(chat_id, f"⚠️ {html_mod.escape(p['name'])} — напиши боту /start в ЛС.")
             except Exception: pass
@@ -1562,20 +1795,26 @@ async def _mafia_night(chat_id):
             if p["role"] == "mafia":
                 others = [x for x in alive if x["role"] != "mafia"]
                 b = InlineKeyboardBuilder()
-                for x in others: b.button(text=html_mod.escape(x["name"]), callback_data=f"mafia_kill:{x['id']}")
+                for x in others: b.button(text=html_mod.escape(x["name"]),
+                                            callback_data=f"mafia_kill:{x['id']}")
                 b.adjust(2)
-                await bot.send_message(p["id"], "🔫 <b>Ты мафия.</b> Кого убить?", reply_markup=b.as_markup(), parse_mode="HTML")
+                await bot.send_message(p["id"], "🔫 <b>Ты мафия.</b> Кого убить?",
+                                        reply_markup=b.as_markup(), parse_mode="HTML")
             elif p["role"] == "doctor":
                 b = InlineKeyboardBuilder()
-                for x in alive: b.button(text=html_mod.escape(x["name"]), callback_data=f"mafia_save:{x['id']}")
+                for x in alive: b.button(text=html_mod.escape(x["name"]),
+                                           callback_data=f"mafia_save:{x['id']}")
                 b.adjust(2)
-                await bot.send_message(p["id"], "💊 <b>Ты доктор.</b> Кого спасти?", reply_markup=b.as_markup(), parse_mode="HTML")
+                await bot.send_message(p["id"], "💊 <b>Ты доктор.</b> Кого спасти?",
+                                        reply_markup=b.as_markup(), parse_mode="HTML")
             elif p["role"] == "detective":
                 others = [x for x in alive if x["id"] != p["id"]]
                 b = InlineKeyboardBuilder()
-                for x in others: b.button(text=html_mod.escape(x["name"]), callback_data=f"mafia_check:{x['id']}")
+                for x in others: b.button(text=html_mod.escape(x["name"]),
+                                            callback_data=f"mafia_check:{x['id']}")
                 b.adjust(2)
-                await bot.send_message(p["id"], "🔍 <b>Ты комиссар.</b> Кого проверить?", reply_markup=b.as_markup(), parse_mode="HTML")
+                await bot.send_message(p["id"], "🔍 <b>Ты комиссар.</b> Кого проверить?",
+                                        reply_markup=b.as_markup(), parse_mode="HTML")
         except Exception: pass
     asyncio.create_task(_mafia_night_timeout(chat_id))
 
@@ -1586,8 +1825,10 @@ async def _mafia_night_timeout(chat_id):
 
 
 @dp.callback_query(F.data.startswith("mafia_kill:"))
-async def cb_mafia_kill(cb):
-    uid = cb.from_user.id; target = int(cb.data.split(":", 1)[1])
+async def cb_mafia_kill(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try: target = int(cb.data.split(":", 1)[1])
+    except Exception: await cb.answer("Ошибка", show_alert=True); return
     for cid, g in MAFIA_GAMES.items():
         if g.get("state") != "night": continue
         for p in g["players"]:
@@ -1598,8 +1839,10 @@ async def cb_mafia_kill(cb):
 
 
 @dp.callback_query(F.data.startswith("mafia_save:"))
-async def cb_mafia_save(cb):
-    uid = cb.from_user.id; target = int(cb.data.split(":", 1)[1])
+async def cb_mafia_save(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try: target = int(cb.data.split(":", 1)[1])
+    except Exception: await cb.answer("Ошибка", show_alert=True); return
     for cid, g in MAFIA_GAMES.items():
         if g.get("state") != "night": continue
         for p in g["players"]:
@@ -1610,8 +1853,10 @@ async def cb_mafia_save(cb):
 
 
 @dp.callback_query(F.data.startswith("mafia_check:"))
-async def cb_mafia_check(cb):
-    uid = cb.from_user.id; target = int(cb.data.split(":", 1)[1])
+async def cb_mafia_check(cb: CallbackQuery):
+    uid = cb.from_user.id
+    try: target = int(cb.data.split(":", 1)[1])
+    except Exception: await cb.answer("Ошибка", show_alert=True); return
     for cid, g in MAFIA_GAMES.items():
         if g.get("state") != "night": continue
         for p in g["players"]:
@@ -1643,8 +1888,10 @@ async def _mafia_end_night(chat_id):
         victim = next((p for p in game["players"] if p["id"] == victim_id), None)
         if victim and victim["alive"]:
             victim["alive"] = False; killed_name = victim["name"]
-    if killed_name: text = f"☀️ <b>ДЕНЬ {game['day']}</b>\n\n💀 Погиб <b>{html_mod.escape(killed_name)}</b>."
-    else: text = f"☀️ <b>ДЕНЬ {game['day']}</b>\n\n🌅 Все выжили."
+    if killed_name:
+        text = f"☀️ <b>ДЕНЬ {game['day']}</b>\n\n💀 Погиб <b>{html_mod.escape(killed_name)}</b>."
+    else:
+        text = f"☀️ <b>ДЕНЬ {game['day']}</b>\n\n🌅 Все выжили."
     end, msg = _mafia_check_end(game)
     if end:
         game["state"] = "finished"
@@ -1678,14 +1925,16 @@ async def _mafia_vote_timeout(chat_id):
 
 
 @dp.callback_query(F.data.startswith("mafia_vote:"))
-async def cb_mafia_vote(cb):
+async def cb_mafia_vote(cb: CallbackQuery):
     chat_id = cb.message.chat.id
     game = MAFIA_GAMES.get(chat_id)
-    if not game or game.get("state") != "vote": await cb.answer("Не голосование", show_alert=True); return
+    if not game or game.get("state") != "vote":
+        await cb.answer("Не голосование", show_alert=True); return
     uid = cb.from_user.id
     if not any(p["id"] == uid and p["alive"] for p in game["players"]):
         await cb.answer("Ты не игрок", show_alert=True); return
-    target = int(cb.data.split(":", 1)[1])
+    try: target = int(cb.data.split(":", 1)[1])
+    except Exception: await cb.answer("Ошибка", show_alert=True); return
     game["votes"][uid] = target
     await cb.answer("Голос принят")
 
@@ -1694,7 +1943,8 @@ async def _mafia_end_vote(chat_id):
     game = MAFIA_GAMES.get(chat_id)
     if not game or game.get("state") != "vote": return
     votes = game.get("votes", {})
-    if not votes: text = "🗳 Никто не голосовал."
+    if not votes:
+        text = "🗳 Никто не голосовал."
     else:
         counter = {}
         for t in votes.values(): counter[t] = counter.get(t, 0) + 1
@@ -1721,7 +1971,7 @@ async def _mafia_end_vote(chat_id):
     await _mafia_night(chat_id)
 
 
-# ============ БИЗНЕС ============
+# ================== БИЗНЕС ==================
 @dp.business_connection()
 async def on_business_connection(connection: BusinessConnection):
     try:
@@ -1735,55 +1985,11 @@ async def on_business_connection(connection: BusinessConnection):
             BUSINESS_CONNECTIONS.pop(connection.id, None)
             DATA.get("business_owners", {}).pop(connection.id, None)
             save_data(DATA)
-    except Exception as e: print(f"business: {str(e)[:150]}", flush=True)
+    except Exception as e:
+        print(f"business: {str(e)[:150]}", flush=True)
 
 
-@dp.business_message()
-async def bc_main(message: Message):
-    try:
-        chat_id = message.chat.id; user = message.from_user; bc_id = message.business_connection_id
-        if not user or not bc_id or _is_dead_bc(bc_id): return
-        DATA.setdefault("business_chats", {})[str(chat_id)] = bc_id
-        owner_id = BUSINESS_CONNECTIONS.get(bc_id, {}).get("user_id") or DATA.get("business_owners", {}).get(bc_id)
-        is_out = (owner_id is not None and user.id == owner_id)
-        text = message.text or message.caption or ""
-        if text.startswith(".") or text.startswith("/"): text = ""
-        if text:
-            hist = DATA.setdefault("history", {}).setdefault(str(chat_id), [])
-            hist.append({"from_id": user.id, "text": text[:400], "ts": time.time(), "is_out": is_out})
-            if len(hist) > HISTORY_LIMIT: DATA["history"][str(chat_id)] = hist[-HISTORY_LIMIT:]
-        if chat_id in MUTED and user.id in MUTED[chat_id]:
-            if is_owner(user): return
-            try: await bot.delete_business_messages(business_connection_id=bc_id, message_ids=[message.message_id])
-            except Exception: pass
-            try: await bot.send_message(chat_id, "🔇 МОЛЧАТЬ!!!", business_connection_id=bc_id)
-            except Exception: pass
-    except Exception as e: print(f"bc_main: {str(e)[:150]}", flush=True)
-
-
-@dp.business_message(F.voice)
-async def bc_voice(message):
-    bc = message.business_connection_id
-    if not bc or _is_dead_bc(bc): return
-    fi = await bot.get_file(message.voice.file_id)
-    src, wav = f"downloads/stt_{message.voice.file_id}.ogg", f"downloads/stt_{message.voice.file_id}.wav"
-    await bot.download_file(fi.file_path, src)
-    try: status = await bot.send_message(message.chat.id, "📝 Слушаю...", business_connection_id=bc)
-    except Exception: return
-    try:
-        loop = asyncio.get_event_loop()
-        text, _ = await loop.run_in_executor(None, _stt_pipeline, src, wav)
-        preview = (f"📝 Расшифровка:\n\n{text[:3900]}" if text else "🤷 Не разобрал.")
-        await bot.edit_message_text(chat_id=message.chat.id, message_id=status.message_id, text=preview, business_connection_id=bc)
-    except Exception as e: print(f"bc stt: {str(e)[:150]}", flush=True)
-    finally:
-        for p in (src, wav):
-            if os.path.exists(p):
-                try: os.remove(p)
-                except Exception: pass
-
-
-# ============ HTTP / ЗАПУСК ============
+# ================== HTTP / ЗАПУСК ==================
 async def _health(request):
     return web.Response(text="ok")
 
@@ -1807,7 +2013,8 @@ async def keep_alive():
             await asyncio.sleep(240)
             me = await bot.get_me()
             print(f"keep-alive: @{me.username}", flush=True)
-        except Exception as e: print(f"keep-alive: {str(e)[:120]}", flush=True)
+        except Exception as e:
+            print(f"keep-alive: {str(e)[:120]}", flush=True)
 
 
 async def set_bot_commands():
@@ -1816,23 +2023,39 @@ async def set_bot_commands():
         BotCommand(command="help", description="Помощь"),
         BotCommand(command="code", description="Активировать ключ"),
         BotCommand(command="mykey", description="Мой ключ"),
-        BotCommand(command="stickers", description="Стикерпаки"),
-        BotCommand(command="whisper", description="Шёпот"),
+        BotCommand(command="whoami", description="Кто я"),
         BotCommand(command="uno", description="Уно"),
         BotCommand(command="mafia", description="Мафия"),
         BotCommand(command="play", description="Старт"),
         BotCommand(command="cancel", description="Отмена"),
     ]
-    try: await bot.set_my_commands(cmds)
-    except Exception as e: print(f"cmds: {e}", flush=True)
+    try:
+        await bot.set_my_commands(cmds)
+    except Exception as e:
+        print(f"cmds: {e}", flush=True)
 
 
 async def set_bot_menu():
-    try: await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    except Exception as e: print(f"menu: {e}", flush=True)
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as e:
+        print(f"menu: {e}", flush=True)
 
 
-dp.message.middleware(AccessMiddleware())
+# ================== РЕГИСТРАЦИЯ MIDDLEWARE И ЗЕРКАЛИРОВАНИЕ ==================
+# 1) Мидлвари — ставим outer, чтобы отрабатывали ДО фильтров хендлеров.
+dp.message.outer_middleware(AccessMiddleware())
+dp.business_message.outer_middleware(BusinessHistoryMiddleware())
+dp.business_message.outer_middleware(AccessMiddleware())
+
+# 2) Зеркалим все message-хендлеры в business_message (тот же колбэк + те же фильтры).
+#    Это критично: в бизнес-чате апдейты приходят как business_message, а не message.
+try:
+    for _h in list(dp.message.handlers):
+        dp.business_message.register(_h.callback, *_h.filters)
+    print(f"[mirror] скопировано хендлеров: {len(dp.message.handlers)}", flush=True)
+except Exception as _e:
+    print(f"[mirror] fail: {_e}", flush=True)
 
 
 async def main():
@@ -1849,5 +2072,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): print("stopped", flush=True)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("stopped", flush=True)
