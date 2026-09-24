@@ -1101,7 +1101,7 @@ async def process_sticker_add(message, state):
                 try: os.remove(f)
                 except Exception: pass
         await state.clear()
-        # ============ ШЁПОТ ============
+# ============ ШЁПОТ ============
 def _next_whisper_id():
     c = int(DATA.get("whisper_counter", 1)); DATA["whisper_counter"] = c + 1; return c
 
@@ -1440,7 +1440,6 @@ async def _uno_bot(game, chat_id):
         for p in game["players"]:
             if p.get("is_bot"): continue
             await _uno_send_dm(p["id"], game)
-        # после сброса бот сразу не ходит, ход перешёл к игроку
         return
     if diff == "easy": pick = random.choice(playable)
     elif diff == "medium":
@@ -1470,9 +1469,20 @@ async def _uno_bot(game, chat_id):
     await _uno_after(game, chat_id, 0, card)
 
 
-# --- УНО в ЛС: и .uno, и /uno, и /uno@bot ---
-@dp.message(F.text.func(lambda t: _normalize_dot(t) in (".uno", "/uno", "uno")))
+# ============ ФИКС: ловим .uno в любом виде ============
+def _is_uno_ls(t):
+    """Ловит .uno /uno .уно /уно .гтщ .uno. . uno и т.п."""
+    if not t: return False
+    s = DOT_SPACES_RE.sub("", t.strip().lower())
+    s = s.rstrip(".!?,;:")
+    variants = (".uno", "/uno", "uno", ".уно", "/уно", "уно",
+                ".гтщ", "/гтщ", "гтщ")
+    return s in variants
+
+
+@dp.message(F.text.func(_is_uno_ls))
 async def cmd_uno_dot(message):
+    print(f"[uno-ls] HIT uid={message.from_user.id} type={message.chat.type} text={message.text!r}")
     if message.chat.type != "private": return
     await _try_delete_command(message)
     chat_id = message.chat.id
@@ -1616,10 +1626,8 @@ async def cmd_play(message):
 @dp.callback_query(F.data.startswith("uno_play:"))
 async def cb_uno_play(cb):
     chat_id = cb.message.chat.id
-    # ищем игру: сначала как ЛС, потом как группа
     game = UNO_GAMES.get(chat_id)
     if not game:
-        # возможно колбэк из ЛС, а игра привязана к ЛС chat_id
         for cid, g in UNO_GAMES.items():
             if g.get("mode") == "ls" and g.get("player_uid") == cb.from_user.id:
                 chat_id = cid; game = g; break
@@ -1786,7 +1794,7 @@ async def bc_voice(message):
                 except Exception: pass
 
 
-# ============ HTTP-СЕРВЕР ДЛЯ HEALTHCHECK RELAXDEV ============
+# ============ HTTP-СЕРВЕР ============
 async def _health(request):
     return web.Response(text="ok")
 
@@ -1821,7 +1829,7 @@ async def set_bot_commands():
         BotCommand(command="mykey", description="Мой ключ"),
         BotCommand(command="stickers", description="Стикерпаки"),
         BotCommand(command="whisper", description="Шёпот"),
-        BotCommand(command="uno", description="Уно (в ЛС с ботом, в группе с людьми)"),
+        BotCommand(command="uno", description="Уно"),
         BotCommand(command="play", description="Старт Уно в группе"),
         BotCommand(command="cancel", description="Отмена"),
     ]
@@ -1839,7 +1847,6 @@ dp.message.middleware(AccessMiddleware())
 
 async def main():
     global DATA
-    # Запускаем HTTP-сервер СРАЗУ, чтобы RelaxDev видел открытый порт
     asyncio.create_task(_run_http_server())
     await asyncio.sleep(0.5)
 
