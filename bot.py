@@ -1073,9 +1073,11 @@ def _ttt_text(game):
     grid = f"{cell(0)} {cell(1)} {cell(2)}\n{cell(3)} {cell(4)} {cell(5)}\n{cell(6)} {cell(7)} {cell(8)}"
     footer = game.get("footer", "") if game.get("finished") else \
              f"Ход: {'❌' if game['turn']=='x' else '⭕'}"
+    x_name = game.get("names", {}).get("x") or "?"
+    o_name = game.get("names", {}).get("o") or "ждём..."
     return (f"❌⭕ <b>Крестики-нолики</b>\n\n"
-            f"❌ {html_mod.escape(game['names'].get('x','?'))}\n"
-            f"⭕ {html_mod.escape(game['names'].get('o','ждём...'))}\n\n{grid}\n\n{footer}")
+            f"❌ {html_mod.escape(x_name)}\n"
+            f"⭕ {html_mod.escape(o_name)}\n\n{grid}\n\n{footer}")
 
 
 def _ttt_kb(game):
@@ -1146,10 +1148,16 @@ async def cb_ttt_move(cb: CallbackQuery):
         if game["board"][a] and game["board"][a] == game["board"][b2] == game["board"][c]:
             w = game["board"][a]; break
     if not w and all(c is not None for c in game["board"]): w = "draw"
-    if w == "X": game["finished"] = True; game["footer"] = f"🏆 Победа! ❌ {html_mod.escape(game['names']['x'])}"
-    elif w == "O": game["finished"] = True; game["footer"] = f"🏆 Победа! ⭕ {html_mod.escape(game['names']['o'])}"
-    elif w == "draw": game["finished"] = True; game["footer"] = "🤝 Ничья!"
-    else: game["turn"] = "o" if turn == "x" else "x"
+    if w == "X":
+        game["finished"] = True
+        game["footer"] = f"🏆 Победа! ❌ {html_mod.escape(game['names']['x'] or '?')}"
+    elif w == "O":
+        game["finished"] = True
+        game["footer"] = f"🏆 Победа! ⭕ {html_mod.escape(game['names']['o'] or '?')}"
+    elif w == "draw":
+        game["finished"] = True; game["footer"] = "🤝 Ничья!"
+    else:
+        game["turn"] = "o" if turn == "x" else "x"
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=cb.message.message_id,
                                      text=_ttt_text(game), reply_markup=_ttt_kb(game),
@@ -1405,7 +1413,6 @@ async def cmd_uno_dot(message: Message, state: FSMContext):
     print(f"[uno] HIT text={message.text!r} type={message.chat.type} biz={bool(message.business_connection_id)}",
           flush=True)
     await state.clear()
-    # в группах маршрутизируем в групповой обработчик (см. cmd_uno_mafia_group через /uno)
     if message.chat.type != "private":
         return
     await _try_delete_command(message)
@@ -2042,20 +2049,15 @@ async def set_bot_menu():
         print(f"menu: {e}", flush=True)
 
 
-# ================== РЕГИСТРАЦИЯ MIDDLEWARE И ЗЕРКАЛИРОВАНИЕ ==================
-# 1) Мидлвари — ставим outer, чтобы отрабатывали ДО фильтров хендлеров.
+# ================== MIDDLEWARE И ЗЕРКАЛИРОВАНИЕ ==================
 dp.message.outer_middleware(AccessMiddleware())
 dp.business_message.outer_middleware(BusinessHistoryMiddleware())
 dp.business_message.outer_middleware(AccessMiddleware())
 
-# 2) Зеркалим все message-хендлеры в business_message (тот же колбэк + те же фильтры).
-#    Это критично: в бизнес-чате апдейты приходят как business_message, а не message.
-try:
-    for _h in list(dp.message.handlers):
-        dp.business_message.register(_h.callback, *_h.filters)
-    print(f"[mirror] скопировано хендлеров: {len(dp.message.handlers)}", flush=True)
-except Exception as _e:
-    print(f"[mirror] fail: {_e}", flush=True)
+# КРИТИЧНО: в бизнес-чате апдейты приходят как business_message, а не message.
+# Переиспользуем те же HandlerObject — просто копируем список.
+dp.business_message.handlers.extend(dp.message.handlers)
+print(f"[mirror] скопировано хендлеров: {len(dp.message.handlers)}", flush=True)
 
 
 async def main():
