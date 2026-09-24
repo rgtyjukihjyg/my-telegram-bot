@@ -792,7 +792,7 @@ async def cmd_mute(message):
     MUTED.setdefault(message.chat.id, set()).add(target.id)
     name = target.full_name or str(target.id)
     await message.answer(f"🔇 <b>МОЛЧАТЬ!!!</b> {html_mod.escape(name)}", parse_mode="HTML")
-    # ============ ШЁПОТ ============
+# ============ ШЁПОТ ============
 def _next_whisper_id():
     c = int(DATA.get("whisper_counter", 1)); DATA["whisper_counter"] = c + 1; return c
 
@@ -1047,8 +1047,23 @@ def _uno_dm_text(game, uid):
     hand = game["hands"].get(str(uid), [])
     top = game["top"]; cur = game["current_color"]
     is_turn = game["players"][game["turn_idx"]]["id"] == uid
-    txt = f"🃏 <b>Твоя рука ({len(hand)}):</b>\nВерхняя: {_uno_label(top)}\nЦвет: {cur}\n\n"
-    txt += "✅ <b>Твой ход!</b>\n" if is_turn else f"⏳ Ждём: {html_mod.escape(game['players'][game['turn_idx']]['name'])}\n"
+
+    counts = []
+    for p in game["players"]:
+        cnt = len(game["hands"].get(str(p["id"]), []))
+        mark = "👈 " if p["id"] == game["players"][game["turn_idx"]]["id"] else ""
+        bot_tag = " 🤖" if p.get("is_bot") else ""
+        counts.append(f"{mark}{html_mod.escape(p['name'])}{bot_tag}: <b>{cnt}</b>")
+    counts_line = " | ".join(counts)
+
+    txt = (f"🎯 Верхняя: {_uno_label(top)}\n"
+           f"🎨 Цвет: {cur} {COLOR_NAMES.get(cur,'')}\n\n"
+           f"👥 Счёт: {counts_line}\n\n")
+    if is_turn:
+        txt += "✅ <b>Твой ход!</b>\n\n"
+    else:
+        txt += f"⏳ Ждём: <b>{html_mod.escape(game['players'][game['turn_idx']]['name'])}</b>\n\n"
+    txt += f"🃏 <b>Твоя рука ({len(hand)}):</b>\n"
     return txt
 
 
@@ -1124,15 +1139,21 @@ async def _uno_bot(game, chat_id):
     top = game["top"]; cur = game["current_color"]; diff = bp.get("difficulty", "medium")
     playable = [(i, c) for i, c in enumerate(hand) if _uno_can(c, top, cur)]
     target = game["chat_id"] if game["mode"] == "ls" else chat_id
+
     if not playable:
         if game["deck"]: hand.append(game["deck"].pop())
         game["turn_idx"] = (game["turn_idx"] + game["direction"]) % len(game["players"])
-        try: await bot.send_message(target, "🤖 Бот взял карту.")
+        try:
+            await bot.send_message(target,
+                f"🤖 <b>Бот взял карту.</b>\n"
+                f"Теперь у бота <b>{len(hand)}</b> карт.",
+                parse_mode="HTML")
         except Exception: pass
         for p in game["players"]:
             if p.get("is_bot"): continue
             await _uno_send_dm(p["id"], game)
         return
+
     if diff == "easy": pick = random.choice(playable)
     elif diff == "medium":
         normals = [(i, c) for i, c in playable if c["color"] != "🌈"]
@@ -1146,6 +1167,7 @@ async def _uno_bot(game, chat_id):
             s = 100 if c["type"]=="wild4" else 80 if c["type"]=="draw2" else 60 if c["type"]=="skip" else 50 if c["type"]=="reverse" else 40 if c["type"]=="wild" else 10 + cc.get(c["color"],0)
             score.append((s, i, c))
         score.sort(reverse=True); pick = (score[0][1], score[0][2])
+
     idx, card = pick
     hand.pop(idx); game["top"] = card
     if card["color"] == "🌈":
@@ -1153,10 +1175,17 @@ async def _uno_bot(game, chat_id):
         for c in hand:
             if c["color"] != "🌈": cc[c["color"]] = cc.get(c["color"], 0) + 1
         game["current_color"] = max(cc, key=cc.get) if (diff == "hard" and cc) else random.choice(UNO_COLORS)
-    else: game["current_color"] = card["color"]
+    else:
+        game["current_color"] = card["color"]
+
     try:
-        sfx = f" → {game['current_color']}" if card["color"] == "🌈" else ""
-        await bot.send_message(target, f"🤖 Бот сбросил {_uno_label(card)}{sfx}")
+        sfx = f" → цвет <b>{game['current_color']}</b>" if card["color"] == "🌈" else ""
+        left = len(hand)
+        uno_warn = " 📣 <b>УНО!</b>" if left == 1 else ""
+        await bot.send_message(target,
+            f"🤖 <b>Бот сбросил {_uno_label(card)}</b>{sfx}\n"
+            f"У бота осталось <b>{left}</b> карт.{uno_warn}",
+            parse_mode="HTML")
     except Exception: pass
     await _uno_after(game, chat_id, 0, card)
 
