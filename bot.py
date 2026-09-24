@@ -222,6 +222,14 @@ async def save_data_to_tg(data):
 DATA = _empty_data()
 
 
+async def save_data_sync(data=None):
+    d = data if data is not None else DATA
+    save_data_to_file(d)
+    if STORAGE_CHAT_ID:
+        try: await save_data_to_tg(d)
+        except Exception as e: print(f"save_data_sync: {str(e)[:150]}")
+
+
 def save_data(data=None):
     d = data if data is not None else DATA
     save_data_to_file(d)
@@ -527,7 +535,9 @@ async def try_activate_key(event, user, key):
     kd["used_by"] = user.id; kd["activated_at"] = now
     entry = {"username": user.username or "", "key": key, "permanent": perm, "activated_at": now}
     if not perm: entry["expires_at"] = now + dur
-    DATA["users"][uid] = entry; save_data(DATA)
+    DATA["users"][uid] = entry
+    await save_data_sync(DATA)
+    print(f"[key] активация сохранена: {key} -> uid={uid}")
     if perm: await event.answer("✅ <b>Ключ активирован!</b>\n♾ навсегда", parse_mode="HTML")
     else: await event.answer(f"✅ <b>Ключ активирован!</b>\n⏱ {format_duration(dur)}", parse_mode="HTML")
 
@@ -624,7 +634,7 @@ async def cb_kc_perm(cb):
     if not is_owner(cb.from_user): await cb.answer("Не твоя", show_alert=True); return
     key = _generate_key()
     DATA["keys"][key] = {"permanent": True, "duration": 0, "created_at": time.time(), "used_by": None}
-    save_data(DATA)
+    await save_data_sync(DATA)
     await cb.message.edit_text(f"♾ <b>Ключ:</b> <code>{key}</code>", parse_mode="HTML")
     await cb.answer("Готово")
 
@@ -644,7 +654,7 @@ async def process_duration(message, state):
         if not dur: await message.answer("🤔 Пример: <code>1d 2h 30m</code>", parse_mode="HTML"); return
         key = _generate_key()
         DATA["keys"][key] = {"permanent": False, "duration": dur, "created_at": time.time(), "used_by": None}
-        save_data(DATA)
+        await save_data_sync(DATA)
         await message.answer(f"⏳ <b>Ключ:</b> <code>{key}</code>\n⏱ {format_duration(dur)}", parse_mode="HTML")
     finally: await state.clear()
 
@@ -653,7 +663,7 @@ async def process_duration(message, state):
 async def cb_key_delete(cb):
     if not is_owner(cb.from_user): await cb.answer("Не твоя", show_alert=True); return
     code = cb.data.split(":", 1)[1].strip().upper()
-    _revoke_by_keycode(code); save_data(DATA)
+    _revoke_by_keycode(code); await save_data_sync(DATA)
     try:
         text, kb = _render_keys_list()
         if kb is None: await cb.message.edit_text(text, parse_mode="HTML")
@@ -668,15 +678,15 @@ async def _do_revoke(message, arg=None):
         tgt = message.reply_to_message.from_user
         if is_owner(tgt): return
         info = _revoke_by_user_id(tgt.id)
-        if info: save_data(DATA); await message.answer("✅ Отозван.")
+        if info: await save_data_sync(DATA); await message.answer("✅ Отозван.")
         return
     if not arg: return
     arg = arg.strip()
     info = _revoke_by_keycode(arg)
-    if info: save_data(DATA); await message.answer("✅ Ключ удалён."); return
+    if info: await save_data_sync(DATA); await message.answer("✅ Ключ удалён."); return
     if arg.isdigit():
         info = _revoke_by_user_id(arg)
-        if info: save_data(DATA); await message.answer("✅ Отозван."); return
+        if info: await save_data_sync(DATA); await message.answer("✅ Отозван."); return
 
 
 @dp.message(F.text.func(dot_starts(".ruletka", ".rl")))
@@ -1030,7 +1040,7 @@ async def process_sticker_first(message, state):
                                     format="static", emoji_list=["😀"])])
         uid = str(message.from_user.id)
         DATA["sticker_packs"].setdefault(uid, []).append({"name": full, "title": title})
-        save_data(DATA)
+        await save_data_sync(DATA)
         await status.edit_text(f"✅ Пак создан!\n🔗 https://t.me/addstickers/{full}")
     except Exception as e:
         try: await status.edit_text(f"❌ {str(e)[:300]}")
@@ -1101,7 +1111,7 @@ async def process_sticker_add(message, state):
                 try: os.remove(f)
                 except Exception: pass
         await state.clear()
-# ============ ШЁПОТ ============
+        # ============ ШЁПОТ ============
 def _next_whisper_id():
     c = int(DATA.get("whisper_counter", 1)); DATA["whisper_counter"] = c + 1; return c
 
@@ -1469,15 +1479,11 @@ async def _uno_bot(game, chat_id):
     await _uno_after(game, chat_id, 0, card)
 
 
-# ============ ФИКС: ловим .uno в любом виде ============
+# --- УНО в ЛС: ловит .uno /uno uno .уно .гтщ .uno. . uno ---
 def _is_uno_ls(t):
-    """Ловит .uno /uno .уно /уно .гтщ .uno. . uno и т.п."""
     if not t: return False
-    s = DOT_SPACES_RE.sub("", t.strip().lower())
-    s = s.rstrip(".!?,;:")
-    variants = (".uno", "/uno", "uno", ".уно", "/уно", "уно",
-                ".гтщ", "/гтщ", "гтщ")
-    return s in variants
+    s = DOT_SPACES_RE.sub("", t.strip().lower()).rstrip(".!?,;:")
+    return s in (".uno", "/uno", "uno", ".уно", "/уно", "уно", ".гтщ", "/гтщ", "гтщ")
 
 
 @dp.message(F.text.func(_is_uno_ls))
@@ -1794,7 +1800,7 @@ async def bc_voice(message):
                 except Exception: pass
 
 
-# ============ HTTP-СЕРВЕР ============
+# ============ HTTP-СЕРВЕР ДЛЯ HEALTHCHECK ============
 async def _health(request):
     return web.Response(text="ok")
 
