@@ -1,7 +1,4 @@
-aiogram>=3.7.0
-aiohttp>=3.9.0
-yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
-faster-whisper
-static-ffmpeg
-pillow
-gTTS>=2.5.0
+aiogram>=3.22
+fastapi
+uvicorn
+httpx
